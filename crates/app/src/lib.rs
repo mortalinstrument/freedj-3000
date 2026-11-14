@@ -2333,8 +2333,10 @@ impl DeckApp {
                 .unwrap_or_else(|| utf16(want));
             let root = nfs.mount(&export)?;
             let (fh, size) = nfs.lookup_path(&root, &path)?;
+            let t_read = Instant::now();
             let audio = nfs.read_file(&fh, size)?;
-            log::info!("LINK {ip}: read {size} bytes ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+            let rs = t_read.elapsed().as_secs_f64().max(1e-3);
+            log::info!("LINK {ip}: read {size} bytes in {:.1} s ({:.2} MB/s); {:.0} ms since the load began", rs, size as f64 / 1e6 / rs, t0.elapsed().as_secs_f64() * 1e3);
             let name = if title.is_empty() { path.rsplit('/').next().unwrap_or(&path).to_string() } else { title };
             prep.complete(Fetched { name, path, audio, grid: FetchedGrid::Beats(beats), t0, meta }, tx)
         })

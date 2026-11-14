@@ -72,6 +72,14 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- SOURCE on a linked player's USB or SD: the pane shows the stick's songs,
+  playlists, date, total and free space as the player reports them (only
+  local folders showed them; a linked stick read 0 and 0).
+- BROWSE on a linked player: the INFO pane shows the track's cover, and the
+  log lists the metadata rows the player sends (key and year come up empty
+  when it leaves them out).  Loading a track no longer asks the player for
+  its metadata a second time, and the playback screen says LOADING while a
+  track is fetched (it only said so in BROWSE, which LOAD leaves).
 - TAG TRACK / REMOVE on the playback screen (also INFO and PERFORM) tags, or
   untags, the track on the deck, as on the CDJ-3000.  It only worked in BROWSE.
 - iOS: sound no longer stops with the ring/silent switch.  The app now
