@@ -1097,7 +1097,7 @@ pub fn draw(
                 // INFO: the middle band shows the loaded track's details.
                 ScreenView::Info => draw_info_screen(ui, snap, lay, h),
                 // MENU / UTILITY: the settings list.
-                ScreenView::Menu(settings, cursor) => draw_menu(ui, settings, cursor, lay, h, out),
+                ScreenView::Menu(settings, cursor) => draw_menu(ui, settings, snap.stems.state, &snap.ip_line, cursor, lay, h, out),
                 ScreenView::Playback | ScreenView::History(..) => {
                     draw_title(ui, snap, lay, h);
                     draw_phase(ui, snap, lay, h, out);
@@ -1250,7 +1250,7 @@ pub const APP_VERSION: &str = match option_env!("OPENDECK_VERSION") {
 };
 pub const SUPPORT_LINE: &str = "support@audiodestrukt.com   ·   audiodestrukt.com/opendeck";
 
-fn draw_menu(ui: &Ui, settings: &Settings, cursor: usize, lay: &Layout, h: f32, out: &mut Vec<Event>) {
+fn draw_menu(ui: &Ui, settings: &Settings, stems: StemsState, ip_line: &str, cursor: usize, lay: &Layout, h: f32, out: &mut Vec<Event>) {
     let p = ui.painter();
     let hdr = lay.title;
     p.rect_filled(hdr, 0.0, BAR);
@@ -1274,7 +1274,8 @@ fn draw_menu(ui: &Ui, settings: &Settings, cursor: usize, lay: &Layout, h: f32, 
         let ink = if sel { BG } else { TEXT };
         text(ui, Pos2::new(row.min.x + h * 0.02, row.center().y), Align2::LEFT_CENTER, *label, h * 0.028, ink);
         text(ui, Pos2::new(row.max.x - h * 0.02, row.center().y), Align2::RIGHT_CENTER,
-             settings.value(*setting), h * 0.028, if sel { BG } else { BLUE });
+             match setting { crate::settings::Setting::Stems => stems.menu_value().unwrap_or_else(|| settings.value(*setting)), _ => settings.value(*setting) },
+             h * 0.028, if sel { BG } else { BLUE });
         if clicked { out.push(Event::Ui(UiEvent::MenuTap(i))); }
     }
 
@@ -1285,6 +1286,10 @@ fn draw_menu(ui: &Ui, settings: &Settings, cursor: usize, lay: &Layout, h: f32, 
     text(ui, Pos2::new(x, body.max.y - pad - h * 0.030), Align2::LEFT_BOTTOM,
          &format!("OpenDeck DJ  {APP_VERSION}"), h * 0.022, DIM);
     text(ui, Pos2::new(x, body.max.y - pad), Align2::LEFT_BOTTOM, SUPPORT_LINE, h * 0.022, DIM);
+    // This deck's address(es), for tools and other players on the network.
+    // The column is narrow here: the first two addresses (Link's first).
+    let two = ip_line.split("  ·  ").take(2).collect::<Vec<_>>().join("  ·  ");
+    text(ui, Pos2::new(body.max.x - pad - h * 0.02, body.max.y - pad - h * 0.030), Align2::RIGHT_BOTTOM, two, h * 0.022, TEXT);
 }
 
 /// INFO screen: the loaded track's details in the middle band — its own tags
@@ -1464,10 +1469,38 @@ fn draw_jog_center(p: &egui::Painter, center: Pos2, radius: f32, snap: &DeckSnap
     }
 }
 
-/// A touch target.  Returns true on tap (press + release inside).
+/// A touch target.  Returns (tapped, held): tapped on a lift inside the
+/// rect.  Not egui's click: that drops a touch that wobbles more than 6
+/// points, one held longer than 0.8 s, and a second finger (another finger
+/// already on the jog or the fader), so keys on the iPad missed taps.  Here
+/// a lift inside counts after up to [`TAP_SLOP`] points of travel, a press
+/// and lift in one frame counts, and a second finger counts too.
 pub(crate) fn tap(ui: &Ui, r: Rect, name: &str) -> (bool, bool) {
-    let resp = ui.interact(r, Id::new(name), Sense::click());
-    (resp.clicked(), resp.is_pointer_button_down_on())
+    let id = Id::new(name);
+    let resp = ui.interact(r, id, Sense::drag());
+    let sec = second_touches_in(ui, name, &[(r, false)])[0];
+    let start = id.with("tap-start");
+    if resp.drag_started() {
+        let at = ui.input(|i| i.pointer.press_origin()).unwrap_or(r.center());
+        ui.data_mut(|d| d.insert_temp(start, at));
+    }
+    let lifted = resp.drag_stopped() && {
+        let from: Pos2 = ui.data(|d| d.get_temp(start)).unwrap_or(r.center());
+        let to = release_pos(ui).unwrap_or(from);
+        r.contains(to) && from.distance(to) <= TAP_SLOP
+    };
+    (lifted || same_frame_tap(ui, r) || sec.tapped, resp.is_pointer_button_down_on() || sec.down)
+}
+
+/// How far a finger may travel and still tap.
+const TAP_SLOP: f32 = 24.0;
+
+/// Where the pointer was released this frame, if it was.
+fn release_pos(ui: &Ui) -> Option<Pos2> {
+    ui.input(|i| i.events.iter().rev().find_map(|e| match e {
+        egui::Event::PointerButton { pos, pressed: false, .. } => Some(*pos),
+        _ => None,
+    }))
 }
 
 /// A stem's touch control, shared by both skins.  A drag along the control
@@ -1628,7 +1661,7 @@ fn expand_glyph(ui: &Ui, key_rect: Rect, h: f32) {
 /// mute or bring back, drag up or down to set a level; the fill shows it),
 /// pad 4 is FULL MIX (every stem back to full: the original track).
 fn draw_stem_pad(ui: &Ui, snap: &DeckSnapshot, i: usize, r: Rect, h: f32, out: &mut Vec<Event>) {
-    let ready = snap.stems.state == StemsState::Ready;
+    let ready = snap.stems.state.playable();
     let p = ui.painter();
     if i == 3 {
         let (clicked, down) = tap(ui, r, "pf-stem-full");
@@ -1653,6 +1686,9 @@ fn draw_stem_pad(ui: &Ui, snap: &DeckSnapshot, i: usize, r: Rect, h: f32, out: &
         StemsState::Ready => format!("{:.0}%", g * 100.0),
         StemsState::Loading => "LOADING".into(),
         StemsState::Splitting(p) => format!("SPLITTING {p}%"),
+        StemsState::Downloading(p) => format!("DOWNLOADING {p}%"),
+        StemsState::Preparing => "PREPARING".into(),
+        StemsState::NoMemory => "NEEDS MORE MEMORY".into(),
         _ => "NO STEMS".into(),
     };
     text(ui, Pos2::new(r.center().x, r.max.y - h * 0.018), Align2::CENTER_CENTER, sub, h * 0.016, c);
@@ -1695,7 +1731,7 @@ fn draw_perform(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, h: f32, out: &mut Ve
     // STEMS (MENU → STEMS on): the pads become the stem controls; tap
     // again to go back to hot cues.
     if snap.stems.state != StemsState::Off {
-        let sub = match snap.stems.state { StemsState::Loading | StemsState::Splitting(_) => "LOADING", StemsState::None => "NONE", _ => "" };
+        let sub = match snap.stems.state { StemsState::Loading | StemsState::Splitting(_) | StemsState::Downloading(_) | StemsState::Preparing => "LOADING", StemsState::None => "NONE", _ => "" };
         if key(ui, pl.mode_stems, "pf-stems", "STEMS", sub, h, stems.then_some(BLUE)) {
             out.push(Event::Ui(UiEvent::PerformMode(if stems { PM::HotCue } else { PM::Stems })));
         }
@@ -1724,7 +1760,7 @@ fn draw_perform(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, h: f32, out: &mut Ve
                 let set    = snap.hot_cues[slot as usize];
                 let face = match set {
                     Some(_) if snap.perform_delete => tint(RED, 210),
-                    Some(_)                        => pad_green,
+                    Some(_)                        => snap.hot_color(slot as usize, pad_green),
                     None if down                   => KEY_HI,
                     None                           => KEY,
                 };
@@ -2193,8 +2229,8 @@ fn draw_bottom(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, h: f32, out: &mut Vec
             let x = ov.min.x + 3.0 + (*pos as f32 / total) * (ov.width() - 6.0);
             p.add(egui::Shape::convex_polygon(
                 vec![Pos2::new(x - 4.0, ty - 4.0), Pos2::new(x + 4.0, ty - 4.0), Pos2::new(x, ty + 3.0)],
-                pad_green, Stroke::NONE));
-            text(ui, Pos2::new(x, ty - h * 0.014), Align2::CENTER_CENTER, (b'A' + i as u8) as char, h * 0.014, pad_green);
+                snap.hot_color(i, pad_green), Stroke::NONE));
+            text(ui, Pos2::new(x, ty - h * 0.014), Align2::CENTER_CENTER, (b'A' + i as u8) as char, h * 0.014, snap.hot_color(i, pad_green));
         }
     }
 
@@ -2474,5 +2510,58 @@ mod stem_touch_tests {
         up.push(vec![btn(Pos2::new(200.0, 110.0), false)]);
         let (g, _) = drive(up, 0.2, false, true, true);
         assert!(g > 0.5 && g < 0.7, "{g}");
+    }
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+    use egui::{Event as E, PointerButton, RawInput, TouchDeviceId, TouchId, TouchPhase};
+
+    /// Runs frames over one key and counts its taps.
+    struct Rig { ctx: egui::Context, r: Rect }
+    impl Rig {
+        fn new() -> Rig { Rig { ctx: egui::Context::default(), r: Rect::from_min_size(Pos2::new(100.0, 100.0), egui::vec2(120.0, 60.0)) } }
+        fn frame(&self, events: Vec<E>) -> bool {
+            let mut hit = false;
+            let r = self.r;
+            let _ = self.ctx.run(RawInput { events, screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| hit = tap(ui, r, "key").0);
+            });
+            hit
+        }
+        /// Press at `from`, move to `to`, lift there: was it a tap?
+        fn press_move_lift(&self, from: Pos2, to: Pos2) -> bool {
+            let btn = |pos, pressed| E::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            let mut hit = self.frame(vec![E::PointerMoved(from)]);
+            hit |= self.frame(vec![btn(from, true)]);
+            hit |= self.frame(vec![E::PointerMoved(to)]);
+            hit |= self.frame(vec![btn(to, false)]);
+            hit | self.frame(vec![E::PointerGone])
+        }
+    }
+
+    #[test]
+    fn a_wobbly_tap_counts_a_slide_off_does_not() {
+        let k = Rig::new();
+        let c = k.r.center();
+        assert!(k.press_move_lift(c, c), "a still tap");
+        assert!(k.press_move_lift(c, c + egui::vec2(15.0, 8.0)), "a finger that wobbles 17 points still taps");
+        assert!(!k.press_move_lift(c, c + egui::vec2(200.0, 0.0)), "sliding off the key is not a tap");
+        assert!(!k.press_move_lift(c + egui::vec2(-50.0, 0.0), c + egui::vec2(50.0, 0.0)), "a long drag across it is not a tap");
+    }
+
+    #[test]
+    fn a_quick_tap_and_a_second_finger_count() {
+        let k = Rig::new();
+        let c = k.r.center();
+        let btn = |pressed| E::PointerButton { pos: c, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let quick = k.frame(vec![E::PointerMoved(c), btn(true), btn(false)]) | k.frame(vec![E::PointerGone]);
+        assert!(quick, "press and lift in one frame");
+
+        let touch = |id: u64, phase, pos| E::Touch { device_id: TouchDeviceId(0), id: TouchId(id), phase, pos, force: None };
+        assert!(!k.frame(vec![touch(1, TouchPhase::Start, Pos2::new(5.0, 5.0))]));
+        assert!(!k.frame(vec![touch(2, TouchPhase::Start, c)]));
+        assert!(k.frame(vec![touch(2, TouchPhase::End, c)]), "a second finger, the first held elsewhere");
     }
 }

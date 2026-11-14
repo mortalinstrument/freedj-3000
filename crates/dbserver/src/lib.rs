@@ -181,9 +181,11 @@ impl Message {
         Field::U32(self.txid).encode(&mut out);
         Field::U16(self.kind).encode(&mut out);
         Field::U8(self.args.len() as u8).encode(&mut out);
-        let mut tags = [0u8; 12];
-        for (i, a) in self.args.iter().take(12).enumerate() { tags[i] = a.arg_tag(); }
-        Field::Blob(tags.to_vec()).encode(&mut out);
+        // One type tag per argument, at least 12 (zero-filled): a CDJ-3000's
+        // 16-field menu rows carry a 16-byte list.
+        let mut tags = vec![0u8; self.args.len().max(12)];
+        for (i, a) in self.args.iter().enumerate() { tags[i] = a.arg_tag(); }
+        Field::Blob(tags).encode(&mut out);
         for a in &self.args { a.encode(&mut out); }
         out
     }
@@ -227,6 +229,10 @@ pub struct MenuItem {
     pub flags:      u32,
     pub artwork_id: u32,
     pub position:   u32,
+    /// A CDJ-3000's track rows carry 16 fields; the tail holds the key's
+    /// name (label 3) and the tempo ×100.  Empty / 0 on shorter rows.
+    pub key:        String,
+    pub bpm_x100:   u32,
 }
 
 impl MenuItem {
@@ -241,6 +247,8 @@ impl MenuItem {
             flags:      m.args[7].as_u32(),
             artwork_id: m.args[8].as_u32(),
             position:   m.args[9].as_u32(),
+            key:        m.args.get(14).map(|f| f.as_str().to_string()).unwrap_or_default(),
+            bpm_x100:   m.args.get(15).map(|f| f.as_u32()).unwrap_or(0),
         })
     }
     /// Human name for `item_type` (the low 16 bits; the upper ones carry flags).
@@ -557,7 +565,7 @@ pub fn parse_beat_grid(blob: &[u8]) -> Vec<GridBeat> {
 mod tests {
     #[test]
     fn typed_track_rows_are_tracks() {
-        let row = |t| MenuItem { parent_id: 0, id: 1, label: "x".into(), label2: String::new(), item_type: t, flags: 0, artwork_id: 0, position: 0 };
+        let row = |t| MenuItem { parent_id: 0, id: 1, label: "x".into(), label2: String::new(), item_type: t, flags: 0, artwork_id: 0, position: 0, key: String::new(), bpm_x100: 0 };
         // 0x0004, "track title and artist/album/BPM/key/…", and a CDJ-3000's
         // extra bits above the low 16.
         for t in [0x0004, 0x0704, 0x0204, 0x0d04, 0x0f04, 0x2e04, 0x0001_0704] {
@@ -570,7 +578,7 @@ mod tests {
 
     #[test]
     fn track_meta_from_rows() {
-        let row = |t, id, l: &str| MenuItem { parent_id: 0, id, label: l.into(), label2: String::new(), item_type: t, flags: 0, artwork_id: 0, position: 0 };
+        let row = |t, id, l: &str| MenuItem { parent_id: 0, id, label: l.into(), label2: String::new(), item_type: t, flags: 0, artwork_id: 0, position: 0, key: String::new(), bpm_x100: 0 };
         let m = TrackMeta::from_rows(&[row(0x04, 9, "Daddy"), row(0x07, 3, "Ali Storm"), row(0x02, 0, "B Album"),
                                        row(0x0d, 12850, ""), row(0x0f, 0, "Am"), row(0x0b, 200, ""), row(0x23, 0, "warm")]);
         assert_eq!(m.comment.as_deref(), Some("warm"));

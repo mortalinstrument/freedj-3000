@@ -1,11 +1,11 @@
-Loads like a CDJ, looks like a CDJ-3000, and plays nicely with CDJ-3000s, rekordbox and lighting.
+STEMS: split any track into drums, vocals and the rest, right on your iPad. Open the STEMS panel and the track starts splitting; the first time, the app fetches its separation model by itself (about 290 MB, once). Stems play while the track is still being split, and the model no longer stays in memory after a split. Stems prepared on a USB stick with OverCue now play within a fraction of a second of loading.
 
-INSTANT LOAD: a track is playable almost the moment you load it. The deck starts as soon as the audio around the cue is ready and the rest loads while it plays, so long tracks no longer keep you waiting.
+KEY SHIFT: move the track up or down a semitone at a time without touching the tempo, with RESET to go back. The KEY readouts show the new key.
 
-CDJ-3000 SCREEN: the CDJ-3000 screen and keys are now the default on the iPad (MENU > SCREEN switches back to the XDJ-1000MK2). BROWSE remembers where you were in each source, and BACK returns to the folder you came from.
+HOT CUE COLOURS: hot cues from a rekordbox stick show in the colours you gave them in rekordbox, on the pads and the waveforms, and other players that load the track from OpenDeck see them too.
 
-PRO DJ LINK: a CDJ-3000 on the same network lists OpenDeck's music in SOURCE, browses it by artist, album, track, key, playlist, history and matching, and loads and plays it with OpenDeck's beat grid, cues and colour waveforms. rekordbox shows OpenDeck as a player. The track you are playing shares its beat grid, waveforms and phrases straight away, so other players and Pro DJ Link lighting controllers can follow it. PLAYER No. AUTO picks a free player number by itself, starting at 4.
+WAVEFORM COLOR: BLUE, RGB or 3BAND in MENU, with 3BAND by default.
 
-ANALYSIS: tracks without a key tag get a detected key, named as rekordbox names it. Beat grids land on the beat and BPMs match rekordbox's closely. OpenDeck also marks phrases (intro, verse, chorus, outro), which a CDJ-3000 can show as coloured bands on the waveform.
+PRO DJ LINK: CDJ-3000s and lighting or timecode tools get the deck's exact play position many times a second, its loops, its hot and memory cues, and each track's key in their browse lists.
 
-FIXES: Apple Lossless (ALAC) and mono tracks load. MP3s were 24 ms off from rekordbox and the players; they now line up. Big folders on a linked player are no longer cut short. No more brief freeze after loading a track for the first time.
+FIXES: rekordbox tracks with cue points kept their beat grid and cues (they could lose both), and hot cues land on the right pads. SLIP works with hot cues and scratching. Loop keys act the moment they are pressed. TEMPO RANGE no longer moves the tempo. The phase meter no longer jumps a beat. Touch keys no longer miss quick taps. 32-bit FLAC plays, and AIFF titles are clean.

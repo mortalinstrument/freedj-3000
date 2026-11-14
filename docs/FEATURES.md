@@ -28,9 +28,11 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 | rekordbox USB sticks: export.pdb categories (ARTIST, ALBUM, TRACK, KEY, PLAYLIST, HISTORY, FOLDER), beat grids, memory and hot cues, preview waveforms, covers | ✅ | All |
 | USB drives plugged into the device (iOS: "USB: ADD DRIVE…" picker, remembered; Android: "All files access") | ✅ | iOS, And, D, Pi |
 | Files-app music folder with a bundled demo track | ✅ | iOS (Android: Music folder) |
-| Stems prepared with OverCue Desktop: mute / solo / level per stem (MENU → STEMS, off by default); the enlarged waveform follows the stem mix; BROWSE marks stem tracks "S" | ✅ | All |
-| Stems split on the device with HTDemucs when a track has none prepared ("SPLITTING n%", then playable); model supplied by the user | 🧪 Linux desktop (`separate-onnx`) measured; iPad built, not yet run | iOS, D (Linux) |
-| Sorting, TRACK FILTER, KEY SHIFT (CDJ-3000 screen) | 📋 | — |
+| Stems prepared with OverCue Desktop: mute / solo / level per stem (STEMS on by default; MENU → STEMS turns it off); the enlarged waveform follows the stem mix; BROWSE marks stem tracks "S". Read page by page: stems play about 0.15 s after a load, before the whole bank is in | ✅ | All |
+| Stems split on the device with HTDemucs when a track has none prepared, starting when its STEMS panel is opened (never on load); the stems play as the split goes ("SPLITTING n%"), the rest of the track as normal. iOS: the model downloads by itself the first time the STEMS panel is opened (287 MB, "DOWNLOADING n%", checked against a pinned hash); a device without the memory for it says "NEEDS MORE MEMORY" and fetches nothing; the model is let go after each split | 🧪 Linux desktop (`separate-onnx`) measured; splits on iPad Air 13" (CPU + GPU, increased memory limit); the download untested on a device | iOS, D (Linux) |
+| Sorting, TRACK FILTER, KEY SYNC (CDJ-3000 screen) | 📋 | — |
+| From rekordbox sticks: hot cue colours, memory cue colours and comments, read from the `.EXT` (USB and LINK) and passed on to CDJs | ✅ byte-built tests; a CDJ-3000 (emulator) draws the colours | All |
+| From rekordbox sticks: rekordbox's phrases, its colour waveforms on load (today OpenDeck shows its own analysis), hot loops as loops, cue comments on screen; cues set on OpenDeck saved across launches | 📋 | — |
 | OneLibrary sticks (rekordbox's new encrypted USB library, read by the CDJ-3000X); today OpenDeck reads the Device Library (`export.pdb`) that rekordbox 7.2.11+ writes alongside it | 📋 | — |
 
 ## Analysis
@@ -44,7 +46,7 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 | Waveforms for other players: blue, RGB (PWV4/PWV5) and 3-band (PWV6/PWV7), fitted to rekordbox's | ✅ | All |
 | Analysis cache (a track is analysed once) | ✅ | All |
 | Key detection for untagged tracks (72 % exact vs rekordbox on a house stick) | ✅ | All |
-| Phrase analysis served as rekordbox PSSI (phrase starts P 0.70 / R 0.73 vs rekordbox on 31 house tracks; mood needs more genres) | 🧪 | All |
+| Phrase analysis served as rekordbox PSSI (phrase starts P 0.70 / R 0.73 vs rekordbox on 31 house tracks; mood needs more genres) | 🧪 a CDJ-3000 (fw 3.22, emulator) fetches it but draws no phrases: its WAVEFORM DIVISIONS setting does not appear, for OpenDeck or for a rekordbox 6.8 stick | All |
 | Downbeat (bar 1) detection; drum & bass at full tempo; 4:5 / 2:3 tempo mistakes | 📋 | — |
 
 ## Playing
@@ -52,14 +54,15 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 | Feature | Status | Where |
 |---|---|---|
 | PLAY / CUE with hold-to-preview and back-cue, AUTO CUE (with level setting) | ✅ | All |
-| Hot cues (A–D on the XDJ screen, A–H on the CDJ-3000 faceplate), memory cues | ✅ | All |
+| Hot cues (A–D on the XDJ screen, A–H on the CDJ-3000 faceplate), memory cues; rekordbox's hot cue colours on pads and waveforms | ✅ | All |
 | Loops: manual IN / OUT, beat loops 1/2–16, BEAT JUMP | ✅ | All |
 | QUANTIZE for cues and loops | ✅ | All |
-| SLIP mode | ✅ | All |
+| SLIP mode: loops, held hot cues, VINYL scratches (the track runs on underneath and returns) | ✅ | All |
 | Jog wheel: VINYL (scratch) and CDJ (nudge) modes; the platter turns under the finger, one turn = one record turn | ✅ | All |
 | Scrub audio: a paused jog (or a VINYL scratch) plays the audio under the playhead | ✅ | All |
 | Drag the big waveform to seek | ✅ | All |
 | Tempo fader ±6 / ±10 / ±16 / WIDE; MASTER TEMPO key lock | ✅ | All |
+| KEY SHIFT (CDJ-3000 screen): ±1 semitone per tap up to an octave, RESET; the tempo stays put; the KEY readouts show the shifted key; a new track starts unshifted. Within 0.2 cents in all three key-lock engines, MASTER TEMPO on or off | ✅ | All (CDJ-3000 screen) |
 | Key-lock engines: Rubber Band R3 (default), Bungee, WSOLA (low-power boards); a tone holds its pitch within 0.2 cents from −16 % to +16 % in all three | ✅ | All (WSOLA for Pi Zero) |
 | Vinyl brake, key lock off (varispeed), real-time sample-rate conversion | 📋 | — |
 
@@ -71,6 +74,7 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 | Waveform Color BLUE / RGB / 3BAND (MENU, saved; 3BAND default, as the CDJ-3000) | ✅ | All |
 | CDJ-3000 screen and faceplate (the default screen; MENU → SCREEN switches; the full deck by default on the Mac, Windows and iPad, `F` / MENU → DECK VIEW toggles it on the desktop): playback, BEAT LOOP / BEAT JUMP panels, SOURCE, BROWSE, TAG LIST, UTILITY, SEARCH, phase meter and master badge, STEMS panel | ✅ | D, Pi, iPad, Android tablet |
 | iPhone / Android phone: two landscape pages (SCREEN, CONTROLS) | ✅ | iOS, And |
+| MENU footer: version, support address and the deck's IP address(es), Link's first | ✅ | All |
 | Keyboard control | ✅ | D |
 | USB MIDI controllers mapped in `controllers.toml` with LED feedback (DJ2Go preset) | ✅ | D, Pi (not yet iOS / Android) |
 | PCF8574 I2C button boards | 🧪 built and unit-tested, no board yet | Pi |
@@ -89,7 +93,7 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 | MASTER, handoff both ways | ✅ tested on an XDJ-1000MK2 | All |
 | LINK: browse and load from other players' USB / SD and from rekordbox (dbserver + NFS), with their grids and cues | ✅ | All |
 | Players browsing OpenDeck: ARTIST, ALBUM, TRACK, KEY, PLAYLIST, HISTORY, MATCHING, FILE NAME | ✅ CDJ-3000 (emulator) | All |
-| Serve our own music to other decks (metadata, grid, waveforms, art, hot and memory cues) | ✅ OpenDeck→OpenDeck; a CDJ-3000 lists, browses (ARTIST, ALBUM, TRACK, PLAYLIST, FILE NAME), loads and plays it with its waveforms (emulator); XDJ untested | All |
+| Serve our own music to other decks (metadata, grid, waveforms, art, hot and memory cues) | ✅ OpenDeck→OpenDeck; a CDJ-3000 lists, browses (ARTIST, ALBUM, TRACK, PLAYLIST, FILE NAME, with PREVIEW, BPM and KEY columns), loads and plays it with its waveforms, shows the hot cues (A–H) and memory cues set on OpenDeck, and its hot cue pads jump to them (emulator, 2026-11-14); XDJ untested | All |
 | The playing track's metadata, grid, waveforms and phrases answer a lookup by the ID our status names, from the moment it loads, wherever the file came from (for other players and Pro DJ Link lighting controllers) | ✅ unit-tested; lighting hardware untested | All |
 | CDJ-3000 Absolute Position packets (playhead ms, length, pitch, BPM every 30 ms on 50001, to each device as a CDJ-3000 sends them) for lighting / video / timecode tools | ✅ measured on a test network; untested with the tester's tool | All |
 | Works over Wi-Fi or ethernet; survives iOS backgrounding | ✅ | All |
@@ -109,5 +113,6 @@ Formats, bit depths, sample rates, tags and key-lock accuracy in detail:
 ## Planned
 
 - Sampler deck: auto one-shots, quantized triggers, cue sequencing ([#24](https://github.com/audiodestrukt/freedj-3000/issues/24)).
+- OpenDeck as an engine with players and features as mods (the CDJ-3000 and XDJ-1000MK2 players among them), without mods ever reaching the audio path: proposal in [design/mods.md](design/mods.md).
 - The remaining CDJ-3000 screen work: [TODO-cdj-3000.md](TODO-cdj-3000.md).
 - Analysis improvements (phrases, mood, downbeats, key): [TODO-analysis.md](TODO-analysis.md).

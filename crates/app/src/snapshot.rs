@@ -17,10 +17,50 @@ pub enum StemsState {
     None,
     /// On; the stems are being read and aligned.  Controls are greyed.
     Loading,
-    /// On; the device is splitting the track itself (percent done).
+    /// On; the device is splitting the track itself (percent done).  The
+    /// controls already work on the part split so far.
     Splitting(u8),
+    /// On; the stem model is downloading (percent), first use only.
+    Downloading(u8),
+    /// On; the downloaded model is being checked and unpacked.
+    Preparing,
+    /// On, but this device has too little memory to split a track (no
+    /// model is downloaded for it either).
+    NoMemory,
+    /// On; the model download failed (no network…) and will be retried.
+    Waiting,
     /// On and playable.
     Ready,
+}
+
+impl StemsState {
+    /// The stem controls work: ready, or split far enough to start.
+    pub fn playable(self) -> bool { matches!(self, StemsState::Ready | StemsState::Splitting(_)) }
+
+    /// While the stem model is being fetched (first use only), the line the
+    /// STEMS panel shows across its keys, so it is plain that a one-time
+    /// download is under way and how far it has got.
+    pub fn fetch_note(self) -> Option<String> {
+        let total = (crate::modelfetch::MODEL.zip_bytes / 1_000_000) as u32;   // MB, as the listing says
+        match self {
+            StemsState::Downloading(p) => Some(format!("DOWNLOADING STEM MODEL  {} / {total} MB  ·  FIRST USE ONLY", total * p as u32 / 100)),
+            StemsState::Preparing => Some("PREPARING STEM MODEL  ·  FIRST USE ONLY".into()),
+            StemsState::Waiting => Some("STEM MODEL DOWNLOAD: WAITING FOR NETWORK".into()),
+            StemsState::NoMemory => Some("THIS DEVICE HAS NOT GOT THE MEMORY TO SPLIT STEMS".into()),
+            _ => None,
+        }
+    }
+
+    /// The MENU's STEMS row while the model is fetched ("ON" otherwise).
+    pub fn menu_value(self) -> Option<String> {
+        match self {
+            StemsState::Downloading(p) => Some(format!("ON · DOWNLOADING MODEL {p}%")),
+            StemsState::Preparing => Some("ON · PREPARING MODEL".into()),
+            StemsState::Waiting => Some("ON · WAITING FOR NETWORK".into()),
+            StemsState::NoMemory => Some("ON · NEEDS MORE MEMORY".into()),
+            _ => None,
+        }
+    }
 }
 
 /// The stem controls' view: state plus drums / vocal / harmonics levels.
@@ -75,6 +115,8 @@ pub struct DeckSnapshot<'a> {
     pub file:         &'a str,
     /// Hot cues A–H (interleaved sample index), for the PERFORM pads + markers.
     pub hot_cues:     [Option<u64>; 8],
+    /// Each hot cue's rekordbox colour (None: the CDJ default green).
+    pub hot_rgb:      [Option<(u8, u8, u8)>; 8],
     /// PERFORM screen state.
     pub perform_mode:   crate::input::PerformMode,
     pub perform_bank:   u8,
@@ -131,10 +173,15 @@ pub struct DeckSnapshot<'a> {
     pub beat2_phase_beats: f32,
     /// External deck's beat within its bar, 1–4 (0 = unknown).
     pub beat2_beat_in_bar: u8,
+    /// KEY SHIFT in semitones (0 = the track's own key).
+    pub key_shift: i8,
 
     /// INFO page: what Link is speaking from ("ip (iface) → broadcast") and
     /// the players heard.  Empty until the sender has started.
     pub link_addr:    String,
+    /// The device's IPv4 addresses for the MENU footer ("IP 192.168.1.23
+    /// (en0)"), the one Link uses first.  Filled while MENU is open.
+    pub ip_line:      String,
     pub link_peers:   String,
 
     /// Waveform columns (of `HOP_SIZE` frames) across the enlarged waveform:
@@ -178,20 +225,52 @@ pub struct RemoteWaveView {
     pub pitch: f32,
 }
 
+impl DeckSnapshot<'_> {
+    /// The key to show: the track's key moved by KEY SHIFT (as the unit's
+    /// KEY readout does), in the notation the track's key came in.
+    pub fn shown_key(&self) -> Option<String> {
+        let k = self.tags.key.as_deref()?;
+        Some(opendeck_analysis::key::Key::shift_name(k, self.key_shift as i32).unwrap_or_else(|| k.to_string()))
+    }
+
+    /// Hot cue `i`'s colour: rekordbox's, else `default` (the skin's green).
+    pub fn hot_color(&self, i: usize, default: egui::Color32) -> egui::Color32 {
+        match self.hot_rgb.get(i).copied().flatten() {
+            Some((r, g, b)) => egui::Color32::from_rgb(r, g, b),
+            None => default,
+        }
+    }
+}
+
+#[cfg(test)]
+mod stems_state_tests {
+    use super::StemsState as S;
+
+    /// The first-use download is spelt out: size, progress, one time only.
+    #[test]
+    fn the_model_fetch_says_what_it_is() {
+        assert_eq!(S::Downloading(43).fetch_note().as_deref(), Some("DOWNLOADING STEM MODEL  123 / 287 MB  ·  FIRST USE ONLY"));
+        assert_eq!(S::Downloading(43).menu_value().as_deref(), Some("ON · DOWNLOADING MODEL 43%"));
+        assert!(S::Waiting.fetch_note().unwrap().contains("WAITING FOR NETWORK"));
+        assert!(S::Ready.fetch_note().is_none() && S::Ready.menu_value().is_none());
+    }
+}
+
 #[cfg(test)]
 impl<'a> DeckSnapshot<'a> {
+
     /// A stopped, empty deck for unit tests; set the fields a test needs.
     pub fn test(tags: &'a opendeck_decode::TrackTags) -> Self {
         DeckSnapshot {
             title: "", loading: None, notice: None, stems: StemsView::default(), tags, file: "", position: 0, sample_rate: 44_100, channels: 2,
-            total_samples: 0, cue_point: 0, memory_cues: &[], hot_cues: [None; 8],
+            total_samples: 0, cue_point: 0, memory_cues: &[], hot_cues: [None; 8], hot_rgb: [None; 8],
             perform_mode: crate::input::PerformMode::HotCue, perform_bank: 0, perform_delete: false,
             loop_active: false, loop_start: 0, loop_end: 0, loop_beats: 0.0, tempo_range: 10.0, quantize: false,
             slip_shadow: None, playing: false, speed: 1.0, fader_speed: 1.0, key_lock: false, jog_vinyl: false,
             remain_mode: true, auto_cue: false, slip: false, sync: false, master: false, zoom_grid_mode: false,
             grid_edited: false, cue_set: false, sync_offset: 0.0, source_link: false, phase_ticks_view: false,
-            linked: false, master_player: 0, player: 1, link_addr: String::new(), link_peers: String::new(),
-            cols_visible: 1.0, local_wave: None, remote_wave: None, peers: Vec::new(), info_player: 0, remote_info: None, beat_grid: None, beat2_bpm: 0.0, beat2_phase_beats: 0.0, beat2_beat_in_bar: 0,
+            linked: false, master_player: 0, player: 1, link_addr: String::new(), ip_line: String::new(), link_peers: String::new(),
+            cols_visible: 1.0, local_wave: None, remote_wave: None, peers: Vec::new(), info_player: 0, remote_info: None, beat_grid: None, beat2_bpm: 0.0, beat2_phase_beats: 0.0, beat2_beat_in_bar: 0, key_shift: 0,
         }
     }
 }
@@ -226,12 +305,17 @@ impl DeckSnapshot<'_> {
 
     /// Fractional position within the current beat, 0.0–1.0, from our own grid.
     pub fn beat_phase(&self) -> Option<f32> {
+        self.beat_pos().map(|(_, f)| f)
+    }
+
+    /// The beat the playhead is in (from the grid's anchor) and how far
+    /// through it, from one reading, so the phase and the beat number never
+    /// disagree (see [`split_beat`]).
+    fn beat_pos(&self) -> Option<(i64, f32)> {
         let g = self.beat_grid?;
         let frames = self.position as f64 / self.channels as f64;
-        let anchor = g.anchor_sample as f64;
         let period = self.sample_rate as f64 * 60.0 / g.bpm;
-        let rel = (frames - anchor) / period;
-        Some(rel.rem_euclid(1.0) as f32)
+        Some(split_beat((frames - g.anchor_sample as f64) / period))
     }
 
     /// Beat number within the bar, 1–4, from our own grid.
@@ -247,9 +331,37 @@ impl DeckSnapshot<'_> {
 
     pub fn beat_in_bar(&self) -> Option<u8> {
         let g = self.beat_grid?;
-        let frames = self.position as f64 / self.channels as f64;
-        let period = self.sample_rate as f64 * 60.0 / g.bpm;
-        let beat = ((frames - g.anchor_sample as f64) / period).floor() as i64;
+        let (beat, _) = self.beat_pos()?;
         Some(((beat + g.downbeat_offset as i64).rem_euclid(4) + 1) as u8)
+    }
+}
+
+/// A position in beats → (whole beat, fraction 0..1).  The fraction is an
+/// f32 for drawing; just under a beat (…7.99999999) it would round up to
+/// 1.0 while the whole beat still read 7, and the phase meter drew that
+/// frame a beat off (its red bar mark jumped).  Such a value counts as the
+/// next beat at 0.
+pub fn split_beat(rel: f64) -> (i64, f32) {
+    let k = rel.floor();
+    let f = (rel - k) as f32;
+    if f >= 1.0 { (k as i64 + 1, 0.0) } else { (k as i64, f) }
+}
+
+#[cfg(test)]
+mod split_beat_tests {
+    use super::split_beat;
+
+    /// Just under a beat the f32 fraction rounds up to 1.0; the whole beat
+    /// must move on with it, or the phase meter draws that frame a beat off.
+    #[test]
+    fn a_fraction_that_rounds_to_one_is_the_next_beat() {
+        assert_eq!(split_beat(7.999_999_999), (8, 0.0));
+        assert_eq!(split_beat(7.5), (7, 0.5));
+        assert_eq!(split_beat(-0.25), (-1, 0.75));
+        for i in 0..200_000 {
+            let rel = 3.0 + i as f64 * 1e-5 - 1e-9;
+            let (k, f) = split_beat(rel);
+            assert!(f < 1.0 && (k as f64 + f as f64 - rel).abs() < 1e-6, "{rel}: {k} + {f}");
+        }
     }
 }

@@ -51,11 +51,23 @@ pub struct Job {
     pub on_start: Option<fn(usize)>,
     /// Called after each chunk: (chunk index, chunks, seconds the model took).
     pub on_chunk: Option<fn(usize, usize, f64)>,
+    /// The bank a split is filling, published once the model is loaded so
+    /// the deck can play the stems already written.
+    pub bank: std::sync::OnceLock<std::sync::Arc<crate::stems::StemBank>>,
 }
 
-impl Job {
-    pub fn percent(&self) -> u8 { (self.progress.load(Ordering::Relaxed) / 10).min(100) as u8 }
+
+/// A split refused because the device cannot give it the memory it needs
+/// (it would be killed partway); the stem keys say so instead.
+#[derive(Debug)]
+pub struct NotEnoughMemory { pub need_mb: u64, pub have_mb: u64 }
+
+impl std::fmt::Display for NotEnoughMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "splitting needs about {} MB free; {} MB is", self.need_mb, self.have_mb)
+    }
 }
+impl std::error::Error for NotEnoughMemory {}
 
 /// What a split took, for the test log.
 #[derive(Debug, Default, Clone)]
@@ -66,9 +78,10 @@ pub struct Timing {
 }
 
 /// Split `track` (interleaved stereo at `deck_sr`) into drums, vocal and
-/// harmonics: interleaved stereo i16 at `deck_sr`, each exactly as long as
-/// `track`.
-pub fn separate(track: &[f32], deck_sr: u32, sep: &mut dyn Separator, job: &Job) -> Result<([Vec<i16>; 3], Timing)> {
+/// harmonics: interleaved stereo i16 at `deck_sr`, handed to `sink` in
+/// order from the start as each stretch is finished (the same length for
+/// all three; together they run to about the track's length).
+pub fn separate(track: &[f32], deck_sr: u32, sep: &mut dyn Separator, job: &Job, sink: &mut dyn FnMut([&[i16]; 3])) -> Result<Timing> {
     let t0 = std::time::Instant::now();
     let frames = track.len() / 2;
     ensure!(frames > 0, "empty track");
@@ -112,9 +125,10 @@ pub fn separate(track: &[f32], deck_sr: u32, sep: &mut dyn Separator, job: &Job)
     let mut wsum: Vec<f32> = Vec::new();
     let mut base = 0usize;
     let mut rs = crate::audio::StreamResampler::new(MODEL_SR, deck_sr, 6)?;
-    let mut outs: [Vec<i16>; 3] = std::array::from_fn(|_| Vec::with_capacity(track.len()));
+    let mut outs: [Vec<i16>; 3] = Default::default();
     // The mix's DC goes back on harmonics, so the three stems add up to it.
-    let emit = |block: &[f32], outs: &mut [Vec<i16>; 3]| {
+    let mut emit = |block: &[f32]| {
+        for o in &mut outs { o.clear(); }
         for f in block.chunks_exact(6) {
             for s in 0..3 {
                 for c in 0..2 {
@@ -123,6 +137,7 @@ pub fn separate(track: &[f32], deck_sr: u32, sep: &mut dyn Separator, job: &Job)
                 }
             }
         }
+        if !outs[0].is_empty() { sink([&outs[0], &outs[1], &outs[2]]); }
     };
 
     let mut input = vec![0f32; 2 * seg];
@@ -165,13 +180,12 @@ pub fn separate(track: &[f32], deck_sr: u32, sep: &mut dyn Separator, job: &Job)
             f.iter_mut().for_each(|v| *v /= w);
         }
         base = done_to;
-        emit(&rs.push(&block)?, &mut outs);
+        emit(&rs.push(&block)?);
         job.progress.store(((k + 1) * 1000 / chunks) as u32, Ordering::Relaxed);
     }
-    emit(&rs.finish()?, &mut outs);
-    for o in &mut outs { o.resize(track.len(), 0); }
+    emit(&rs.finish()?);
     timing.total_s = t0.elapsed().as_secs_f64();
-    Ok((outs, timing))
+    Ok(timing)
 }
 
 /// HTDemucs through Core ML, on iOS (the shim is in `ios/freedj/main.m`).
@@ -187,6 +201,7 @@ pub mod coreml {
     extern "C" {
         fn freedj_sep_model_present() -> bool;
         fn freedj_sep_open(err: *mut c_char, errlen: usize) -> *mut c_void;
+        fn freedj_sep_close(h: *mut c_void);
         fn freedj_sep_segment(h: *mut c_void) -> usize;
         fn freedj_sep_run(h: *mut c_void, mix: *const f32, out: *mut f32, n: usize, err: *mut c_char, errlen: usize) -> bool;
         fn freedj_mem_footprint() -> u64;
@@ -233,6 +248,13 @@ pub mod coreml {
             }
             Ok(())
         }
+    }
+
+    /// Unload the model: it holds about 4 GB, which the deck should not
+    /// carry through a set.  The next split loads it again (~4.5 s).
+    pub fn release() {
+        let mut g = MODEL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.take() { unsafe { freedj_sep_close(m.h) }; }
     }
 
     /// Process memory: (footprint, still available before iOS kills us), MB.
@@ -334,6 +356,20 @@ pub mod model {
         #[allow(unreachable_code)] Err(anyhow::anyhow!("no separation model on this platform"))
     }
 
+    /// Unload the model after a split, where it is big (iOS).
+    pub fn release() {
+        #[cfg(target_os = "ios")] { super::coreml::release(); }
+    }
+
+    /// Memory a split needs free before it starts, MB.  iPad Air 13", Core
+    /// ML on CPU + GPU, 0.3.12 (standard memory limit): the model loaded at
+    /// 893 MB, then the app was killed in the first chunk with 4226 MB
+    /// still left, so a split needs more than ~4.2 GB beyond the loaded
+    /// model (~0.2 GB).  With the increased limit (0.3.13) it splits.  A
+    /// guess from one failure, to be replaced with a measured peak.  (Linux,
+    /// ONNX Runtime on the CPU, is different: 548 → 5219 MB.)
+    pub const SPLIT_NEEDS_MB: u64 = 4_600;
+
     /// (process memory, memory left before the OS steps in), MB.
     pub fn memory_mb() -> (u64, u64) {
         #[cfg(target_os = "ios")] { return super::coreml::memory_mb(); }
@@ -359,6 +395,16 @@ pub mod model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A split through the deck's own path: into a filling bank, as the
+    /// app does, then read back.
+    pub(super) fn split(track: &[f32], sr: u32, sep: &mut dyn Separator, job: &Job) -> Result<([Vec<i16>; 3], Timing)> {
+        let t = std::sync::Arc::new(track.to_vec());
+        let bank = crate::stems::StemBank::filling(&t);
+        let timing = separate(track, sr, sep, job, &mut |b| bank.append(b))?;
+        bank.finish(sr);
+        Ok(([bank.stem(0), bank.stem(1), bank.stem(2)], timing))
+    }
 
     /// A model with a known answer: drums = ½ mix, bass = other = ¼ mix,
     /// vocals = silence, with a different short segment so chunk edges
@@ -399,10 +445,10 @@ mod tests {
         let track = tone(sr as usize * 3 + 123, sr);
         let mut fake = Fake { seg: 10_000, calls: 0 };
         let job = Job::default();
-        let ([drums, vocal, harm], t) = separate(&track, sr, &mut fake, &job).unwrap();
+        let ([drums, vocal, harm], t) = split(&track, sr, &mut fake, &job).unwrap();
         assert_eq!(drums.len(), track.len());
         assert_eq!(fake.calls, t.chunks);
-        assert_eq!(job.percent(), 100);
+        assert_eq!(job.progress.load(Ordering::Relaxed), 1000);
         // Away from the very ends (the rate converters' edges).
         let lo = 2_000;
         let hi = track.len() - 2_000;
@@ -429,7 +475,7 @@ mod tests {
     fn a_track_shorter_than_one_chunk_splits() {
         let track = tone(3_000, 44_100);
         let mut fake = Fake { seg: 10_000, calls: 0 };
-        let ([d, _, h], t) = separate(&track, 44_100, &mut fake, &Job::default()).unwrap();
+        let ([d, _, h], t) = split(&track, 44_100, &mut fake, &Job::default()).unwrap();
         assert_eq!(t.chunks, 1);
         assert_eq!(d.len(), track.len());
         assert_eq!(h.len(), track.len());
@@ -440,7 +486,7 @@ mod tests {
         let track = tone(100_000, 44_100);
         let job = Job::default();
         job.cancel.store(true, Ordering::Relaxed);
-        assert!(separate(&track, 44_100, &mut Fake { seg: 10_000, calls: 0 }, &job).is_err());
+        assert!(split(&track, 44_100, &mut Fake { seg: 10_000, calls: 0 }, &job).is_err());
     }
 }
 
@@ -451,6 +497,7 @@ mod tests {
 mod real {
     use super::*;
     use opendeck_types::Decoder;
+    use super::tests::split;
 
     #[test]
     #[ignore]
@@ -465,17 +512,17 @@ mod real {
         loop { match d.decode(&mut buf).unwrap() { 0 => break, n => pcm.extend_from_slice(&buf[..n * ch]) } }
         let track = crate::audio::resample_interleaved(&pcm, 2, d.sample_rate(), sr).unwrap();
         let job = Job::default();
-        let ((stems, t), load_s) = model::with(|m| separate(&track, sr, m, &job)).unwrap();
+        let ((stems, t), load_s) = model::with(|m| split(&track, sr, m, &job)).unwrap();
         let secs = track.len() as f64 / 2.0 / sr as f64;
         println!("{secs:.0}s track | load {load_s:.1}s | {} chunks, model {:.1}s, total {:.1}s = {:.1}x real time | peak {} MB",
                  t.chunks, t.model_s, t.total_s, secs / t.total_s, model::memory_mb().0);
         // On a stick with OverCue stems for this file: how close are ours?
         // SDR with OverCue's stem as the reference (higher is closer).
         let track = std::sync::Arc::new(track);
-        if let Ok(Some(oc)) = crate::stems::load_local(std::path::Path::new(&inp), &track, sr, 2) {
+        if let Ok(Some(oc)) = crate::stems::load_local(std::path::Path::new(&inp), &track, sr, 2, None) {
             for (i, name) in ["drums", "vocal", "harmonics"].iter().enumerate() {
                 let (mut num, mut den) = (0f64, 0f64);
-                for (a, b) in oc.data[i].iter().zip(&stems[i]) {
+                for (a, b) in oc.stem(i).iter().zip(&stems[i]) {
                     let (a, b) = (*a as f64, *b as f64);
                     num += a * a;
                     den += (a - b) * (a - b);

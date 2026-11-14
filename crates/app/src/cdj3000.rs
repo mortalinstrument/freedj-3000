@@ -17,7 +17,7 @@
 use crate::browser::Browser;
 use crate::input::{ControlEvent, Event, Screen as TopScreen, UiEvent};
 use crate::screen::ScreenView;
-use crate::settings::MENU;
+use crate::settings::{Setting, MENU};
 use crate::taglist::TagList;
 use crate::screen::{bars_to_next, cover, needle_touch, stem_touch, tap, wave_touch, STEM_NAMES};
 use crate::settings::Settings;
@@ -67,6 +67,8 @@ pub enum Panel {
     None,
     BeatLoop,
     BeatJump,
+    /// KEY SHIFT: − / + one semitone, the key and its offset, RESET.
+    KeyShift,
     /// Stems (MENU → STEMS on): FULL MIX, TOGGLE / VOLUME, and the stems.
     Stems,
 }
@@ -84,6 +86,7 @@ pub fn panel_from_env(ctx: &egui::Context) {
     let p = match std::env::var("OPENDECK_CDJ_PANEL").as_deref() {
         Ok("loop") => Panel::BeatLoop,
         Ok("jump") => Panel::BeatJump,
+        Ok("key") => Panel::KeyShift,
         Ok("stems") => Panel::Stems,
         _ => return,
     };
@@ -335,6 +338,7 @@ pub fn draw(ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, view: &Scree
                     _ if snap.zoom_grid_mode => draw_grid_keys(ui, snap, lay, u, out),
                     Panel::BeatLoop => draw_loop_panel(ui, ctx, snap, lay, u, out),
                     Panel::BeatJump => draw_jump_panel(ui, ctx, lay, u, out),
+                    Panel::KeyShift => draw_key_panel(ui, snap, lay, u, out),
                     Panel::Stems if snap.stems.state != StemsState::Off => draw_stems_panel(ui, ctx, snap, lay, u, out),
                     Panel::Stems | Panel::None => {}
                 }
@@ -433,7 +437,7 @@ fn draw_header(ui: &Ui, ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, 
         clip.text(Pos2::new(row.min.x + 35.0 * u, y), Align2::LEFT_CENTER, format!("{:02}:{:02}", secs / 60, secs % 60), FontId::proportional(33.0 * u), TEXT);
         let bpm = snap.beat_grid.map(|g| format!("{:.1}", g.bpm)).unwrap_or_else(|| "0.0".into());
         clip.text(Pos2::new(row.min.x + 170.0 * u, y), Align2::LEFT_CENTER, bpm, FontId::proportional(33.0 * u), TEXT);
-        if let Some(k) = snap.tags.key.as_deref() {
+        if let Some(k) = snap.shown_key() {
             clip.text(Pos2::new(row.min.x + 265.0 * u, y), Align2::LEFT_CENTER, k, FontId::proportional(33.0 * u), TEXT);
         }
     }
@@ -444,10 +448,9 @@ fn draw_header(ui: &Ui, ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, 
     label(ui, i.center(), Align2::CENTER_CENTER, "i", 20.0, u, Color32::BLACK);
 
     // BEAT LOOP / KEY SHIFT / BEAT JUMP touch keys: each opens its panel
-    // under the waveform (again, or another key, closes or swaps it). KEY
-    // SHIFT has no panel until the deck can shift key.
+    // under the waveform (again, or another key, closes or swaps it).
     let open = panel(ctx);
-    let targets = [Some(Panel::BeatLoop), None, Some(Panel::BeatJump)];
+    let targets = [Some(Panel::BeatLoop), Some(Panel::KeyShift), Some(Panel::BeatJump)];
     for ((k, (a, b)), target) in lay.keys.iter().zip([("BEAT", "LOOP"), ("KEY", "SHIFT"), ("BEAT", "JUMP")]).zip(targets) {
         if let Some(t) = target {
             if tap(ui, *k, &format!("cdj-key-{a}{b}")).0 {
@@ -470,11 +473,18 @@ fn draw_header(ui: &Ui, ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, 
         if tap(ui, k, "cdj-key-stems").0 {
             set_panel(ctx, if open == Panel::Stems { Panel::None } else { Panel::Stems });
         }
-        let ready = snap.stems.state == StemsState::Ready;
+        let ready = snap.stems.state.playable();
         p.rect_filled(k, 0.0, if open == Panel::Stems { KEY_LIT } else { KEY_FACE });
         let changed = ready && snap.stems.changed() && open != Panel::Stems;
         let bar = Rect::from_center_size(Pos2::new(k.center().x, k.max.y - 3.0 * u), Vec2::new(if changed { 90.0 } else { 56.0 } * u, 3.0 * u));
         p.rect_filled(bar, 0.0, if changed { KEY_LIT } else { KEY_EDGE });
+        // The model downloading (first use): the bar fills as it goes, so it
+        // shows with the panel closed too.
+        if let StemsState::Downloading(pc) = snap.stems.state {
+            let wide = Rect::from_center_size(bar.center(), Vec2::new(90.0 * u, 3.0 * u));
+            p.rect_filled(wide, 0.0, KEY_EDGE);
+            p.rect_filled(Rect::from_min_size(wide.min, Vec2::new(wide.width() * pc as f32 / 100.0, wide.height())), 0.0, KEY_LIT);
+        }
         label(ui, Pos2::new(k.center().x, k.min.y + 45.0 * u), Align2::CENTER_CENTER, "STEMS", 21.0, u, if ready { TEXT } else { DIM });
     }
 }
@@ -567,7 +577,7 @@ fn draw_field(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, u: f32, out: &mut Vec<
             let x = x_of(*pos);
             if !on(x) { continue; }
             let b = Rect::from_min_size(Pos2::new(x, top), Vec2::new(17.0 * u, 16.0 * u));
-            p.rect_filled(b, 0.0, CUE_GREEN);
+            p.rect_filled(b, 0.0, snap.hot_color(i, CUE_GREEN));
             label(ui, b.center(), Align2::CENTER_CENTER, (b'A' + i as u8) as char, 13.0, u, Color32::BLACK);
         }
         let x = x_of(snap.cue_point);
@@ -1079,7 +1089,7 @@ fn stems_volume_id() -> Id { Id::new("cdj3k-stems-volume") }
 /// when every stem is fully on or off (its label greys until then).
 /// Everything is grey and inert until the track's stems are ready.
 fn draw_stems_panel(ui: &Ui, ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, u: f32, out: &mut Vec<Event>) {
-    let ready = snap.stems.state == StemsState::Ready;
+    let ready = snap.stems.state.playable();
     let mut volume: bool = ctx.data(|d| d.get_temp(stems_volume_id())).unwrap_or(false);
     if !snap.stems.all_on_or_off() { volume = true; }
     let text_c = if ready { TEXT } else { DIM };
@@ -1116,13 +1126,29 @@ fn draw_stems_panel(ui: &Ui, ctx: &egui::Context, snap: &DeckSnapshot, lay: &Lay
             checker(ui, r, fill, CHECK_LIT, u);
         }
         label(ui, r.center(), Align2::CENTER_CENTER, *name, 22.0, u, text_c);
+        if snap.stems.state.fetch_note().is_some() { continue; }   // the band below says it once
         let sub = match snap.stems.state {
             StemsState::Loading => "LOADING".to_string(),
             StemsState::Splitting(p) => format!("SPLITTING {p}%"),
+            StemsState::Downloading(p) => format!("DOWNLOADING {p}%"),
+            StemsState::Preparing => "PREPARING".to_string(),
+            StemsState::NoMemory => "NEEDS MORE MEMORY".to_string(),
             StemsState::None => "NO STEMS".to_string(),
             _ => String::new(),
         };
         if !sub.is_empty() { label(ui, Pos2::new(r.center().x, r.center().y + 24.0 * u), Align2::CENTER_CENTER, &sub, 15.0, u, DIM); }
+    }
+
+    // First use: one band across the stem keys says the model is being
+    // fetched, how far, and that it is a one-time thing.
+    if let Some(note) = snap.stems.state.fetch_note() {
+        let band = Rect::from_min_max(Pos2::new(k.stems[0].min.x, k.stems[0].max.y - 30.0 * u), k.stems[2].max);
+        ui.painter().rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+        if let StemsState::Downloading(pc) = snap.stems.state {
+            let fill = Rect::from_min_size(Pos2::new(band.min.x, band.max.y - 4.0 * u), Vec2::new(band.width() * pc as f32 / 100.0, 4.0 * u));
+            ui.painter().rect_filled(fill, 0.0, KEY_LIT);
+        }
+        label(ui, Pos2::new(band.center().x, band.center().y - 2.0 * u), Align2::CENTER_CENTER, note, 17.0, u, TEXT);
     }
 
     // EQ: grey; Stems EQ comes from a mixer we do not support.
@@ -1176,6 +1202,55 @@ fn draw_jump_panel(ui: &Ui, ctx: &egui::Context, lay: &Layout, u: f32, out: &mut
         }
     }
     page_switch(ui, ctx, Panel::BeatJump, lay.page, u);
+}
+
+/// The KEY SHIFT panel's keys: −, the readout, RESET under it, +.
+struct KeyShiftKeys { minus: Rect, readout: Rect, reset: Rect, plus: Rect }
+
+fn key_shift_keys(lay: &Layout) -> KeyShiftKeys {
+    let s = lay.screen.height() / ASPECT.y;
+    let (y0, y1) = (lay.panel[0].min.y, lay.panel[0].max.y);
+    let at = |x0: f32, x1: f32, a: f32, b: f32| Rect::from_min_max(
+        Pos2::new(lay.screen.min.x + x0 * s, a), Pos2::new(lay.screen.min.x + x1 * s, b));
+    let mid = y0 + (y1 - y0) * 0.58;
+    KeyShiftKeys {
+        minus:   at(300.0, 500.0, y0, y1),
+        readout: at(530.0, 750.0, y0, mid),
+        reset:   at(580.0, 700.0, mid + 3.0 * s, y1),
+        plus:    at(780.0, 980.0, y0, y1),
+    }
+}
+
+/// KEY SHIFT: − and + each move the key a semitone and are labelled with the
+/// key they lead to; the middle shows the key and its offset ("Fm +2"), and
+/// RESET puts the track back in its own key.  The tempo never moves.
+fn draw_key_panel(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, u: f32, out: &mut Vec<Event>) {
+    let k = key_shift_keys(lay);
+    let shift = snap.key_shift;
+    let key_at = |n: i8| snap.tags.key.as_deref()
+        .and_then(|t| opendeck_analysis::key::Key::shift_name(t, n as i32));
+    for (r, step, sign, id) in [(k.minus, -1i8, "−", "cdj-key-minus"), (k.plus, 1, "+", "cdj-key-plus")] {
+        let to = (shift + step).clamp(-crate::KEY_SHIFT_MAX, crate::KEY_SHIFT_MAX);
+        if tap(ui, r, id).0 && to != shift {
+            out.push(Event::Deck(ControlEvent::KeyShift { semitones: to }));
+        }
+        let p = ui.painter();
+        p.rect_filled(r, 0.0, PANEL_FACE);
+        outline(ui, r, DIM, u);
+        label(ui, Pos2::new(r.min.x + 30.0 * u, r.center().y), Align2::CENTER_CENTER, sign, 34.0, u, TEXT);
+        if let Some(name) = key_at(to) {
+            label(ui, Pos2::new(r.center().x + 15.0 * u, r.center().y), Align2::CENTER_CENTER, name, 26.0, u, TEXT);
+        }
+    }
+    let now = snap.shown_key().unwrap_or_else(|| "--".into());
+    let offset = if shift == 0 { String::new() } else { format!("  {shift:+}") };
+    label(ui, k.readout.center(), Align2::CENTER_CENTER, format!("{now}{offset}"), 28.0, u, if shift == 0 { TEXT } else { ORANGE });
+    if tap(ui, k.reset, "cdj-key-reset").0 && shift != 0 {
+        out.push(Event::Deck(ControlEvent::KeyShift { semitones: 0 }));
+    }
+    ui.painter().rect_filled(k.reset, 0.0, PANEL_FACE);
+    outline(ui, k.reset, DIM, u);
+    label(ui, k.reset.center(), Align2::CENTER_CENTER, "RESET", 17.0, u, if shift == 0 { DIM } else { TEXT });
 }
 
 // ── INFO ─────────────────────────────────────────────────────────────────────
@@ -2367,7 +2442,8 @@ fn draw_tag_list(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, tags: &TagList, u: 
 fn draw_utility(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, settings: &Settings, cursor: usize, u: f32, out: &mut Vec<Event>) {
     let sc = lay.screen;
     let rows: Vec<Row> = MENU.iter().map(|(s, name)| Row {
-        icon: RowIcon::None, text: name, value: Some(settings.value(*s)), tagged: false, played: false, stems: false,
+        icon: RowIcon::None, text: name, tagged: false, played: false, stems: false,
+        value: Some(match s { Setting::Stems => snap.stems.state.menu_value().unwrap_or_else(|| settings.value(*s)), _ => settings.value(*s) }),
     }).collect();
     draw_list_header(ui, snap, lay, "UTILITY", false, cached_tile(), u, out);
     let pane = Rect::from_min_max(Pos2::new(sc.min.x + 92.0 * u, sc.min.y + 92.0 * u), Pos2::new(sc.max.x, sc.min.y + 628.0 * u));
@@ -2385,6 +2461,8 @@ fn draw_utility(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, settings: &Settings,
     label(ui, Pos2::new(x, pane.max.y - 40.0 * u), Align2::LEFT_BOTTOM,
           format!("OpenDeck DJ  {}", crate::screen::APP_VERSION), 18.0, u, foot);
     label(ui, Pos2::new(x, pane.max.y - 14.0 * u), Align2::LEFT_BOTTOM, crate::screen::SUPPORT_LINE, 18.0, u, foot);
+    // This deck's address(es), for tools and other players on the network.
+    label(ui, Pos2::new(pane.max.x - 16.0 * u, pane.max.y - 14.0 * u), Align2::RIGHT_BOTTOM, &snap.ip_line, 18.0, u, TEXT);
     draw_status_strip(ui, snap, lay, u, out);
 }
 
@@ -2492,7 +2570,7 @@ fn draw_info_block(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, u: f32, out: &mut
         let Some(pos) = c else { continue };
         let x = ov.min.x + *pos as f32 / total * ov.width();
         let flag = Rect::from_min_size(Pos2::new(x, lay.flags.min.y), Vec2::new(13.0 * u, lay.flags.height()));
-        p.rect_filled(flag, 0.0, CUE_GREEN);
+        p.rect_filled(flag, 0.0, snap.hot_color(i, CUE_GREEN));
         label(ui, flag.center(), Align2::CENTER_CENTER, (b'A' + i as u8) as char, 12.0, u, Color32::BLACK);
     }
     // Memory points: red ▼ over the overview.
@@ -2547,8 +2625,66 @@ fn draw_info_block(ui: &Ui, snap: &DeckSnapshot, lay: &Layout, u: f32, out: &mut
     }
     let k = lay.key;
     label(ui, Pos2::new(k.center().x, k.min.y + 15.0 * u), Align2::CENTER_CENTER, "KEY", 15.0, u, TEXT);
-    if let Some(key) = snap.tags.key.as_deref() {
+    if let Some(key) = snap.shown_key() {
         label(ui, Pos2::new(k.center().x, k.min.y + 50.0 * u), Align2::CENTER_CENTER, key, 34.0, u, TEXT);
+    }
+}
+
+#[cfg(test)]
+mod key_shift_panel_tests {
+    use super::*;
+    use egui::{Event as E, PointerButton, RawInput};
+
+    fn click(ctx: &egui::Context, snap: &DeckSnapshot, lay: &Layout, at: Pos2) -> Vec<Event> {
+        let frame = |events: Vec<E>| {
+            let mut out = Vec::new();
+            let u = lay.screen.height() / ASPECT.y;
+            let _ = ctx.run(RawInput { events, screen_rect: Some(lay.screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
+                    draw_header(ui, ctx, snap, lay, u, &mut out);
+                    if panel(ctx) == Panel::KeyShift { draw_key_panel(ui, snap, lay, u, &mut out); }
+                });
+            });
+            out
+        };
+        let btn = |pressed| E::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![E::PointerMoved(at)]);
+        let mut out = frame(vec![btn(true)]);
+        out.extend(frame(vec![btn(false)]));
+        out.extend(frame(vec![]));
+        out
+    }
+
+    /// The KEY SHIFT key opens the panel; − and + step a semitone from where
+    /// the key is, RESET returns to 0, and the readouts show the moved key in
+    /// the track's own notation.
+    #[test]
+    fn key_shift_panel_steps_and_resets() {
+        let tags = opendeck_decode::TrackTags { key: Some("Fm".into()), ..Default::default() };
+        let lay = layout(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0)), true);
+        let ctx = egui::Context::default();
+        let mut snap = DeckSnapshot::test(&tags);
+        click(&ctx, &snap, &lay, lay.keys[1].center());
+        assert_eq!(panel(&ctx), Panel::KeyShift);
+        let k = key_shift_keys(&lay);
+        let shift = |out: Vec<Event>| match out.as_slice() {
+            [Event::Deck(ControlEvent::KeyShift { semitones })] => Some(*semitones),
+            [] => None,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.plus.center())), Some(1));
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.minus.center())), Some(-1));
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.reset.center())), None, "RESET at 0 does nothing");
+        snap.key_shift = 2;
+        assert_eq!(snap.shown_key().as_deref(), Some("Gm"), "Fm up two is Gm");
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.plus.center())), Some(3));
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.reset.center())), Some(0));
+        snap.key_shift = 12;
+        assert_eq!(shift(click(&ctx, &snap, &lay, k.plus.center())), None, "an octave is the limit");
+        let camelot = opendeck_decode::TrackTags { key: Some("4A".into()), ..Default::default() };
+        let mut s2 = DeckSnapshot::test(&camelot);
+        s2.key_shift = 1;
+        assert_eq!(s2.shown_key().as_deref(), Some("11A"), "Camelot stays Camelot: Fm (4A) + 1 = F#m (11A)");
     }
 }
 

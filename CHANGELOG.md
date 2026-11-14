@@ -4,7 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.23] — 2026-11-14
+
 ### Added
+- MENU (UTILITY) shows the deck's IP address in its footer: the address Pro
+  DJ Link uses first, then the device's other networks (up to three on the
+  CDJ-3000 screen, two on the XDJ screen; containers, VPNs and Apple's
+  peer-to-peer links left out). It follows a network change while MENU is
+  open.
+- STEMS is on by default (MENU → STEMS turns it off; an older settings file
+  with it off turns on once). Loading a track splits nothing: prepared stems
+  on a stick play as the track loads, and a track without them is split on
+  the device when its STEMS panel (or the XDJ screen's STEMS pad mode) is
+  opened, so nobody pays the download, heat or battery for stems they never
+  asked for.
+- Stems on the iPad and iPhone without copying files: the first time the
+  STEMS panel is opened for a track with no prepared stems, the app downloads the stem model
+  itself (287 MB, once), checks it against a pinned hash, and starts
+  splitting the loaded track as soon as it is in. While it downloads, the
+  STEMS panel says so across its keys ("DOWNLOADING STEM MODEL 123 / 287 MB ·
+  FIRST USE ONLY"), the STEMS key's bar fills, and MENU reads "ON ·
+  DOWNLOADING MODEL n%"; without a network it says it is waiting. It is kept out of iCloud backups. A model
+  put in the OpenDeck folder by hand still takes precedence.
+- KEY SHIFT on the CDJ-3000 screen. The KEY SHIFT key opens its panel: − and
+  + move the key a semitone each (up to an octave either way), labelled with
+  the key they lead to; the middle shows the key and its offset, and RESET
+  puts the track back in its own key. The tempo does not move. The KEY
+  readouts show the shifted key, in the notation the track's key came in.
+  Each new track starts in its own key. Works in all three key-lock engines,
+  with MASTER TEMPO on or off.
+- Hot cue colours from rekordbox. A stick track's hot cues show in the
+  colours set in rekordbox, on the pads, the waveform flags and the overview
+  of both screens. Cues with no colour stay green. A CDJ-3000 that loads the
+  track from OpenDeck gets the same colours (with its HOT CUE COLOR setting
+  on), along with memory cue colours and every cue's comment. The colours come
+  from the stick's `.EXT` analysis file, read for USB sticks and for tracks
+  loaded from another player over LINK. Setting a pad again on the deck makes
+  it a plain green cue.
+- `fixture_stick` example (opendeck-rekordbox): builds a test rekordbox stick
+  from the demo export with your audio and coloured, commented cues; point
+  OpenDeck at it with `OPENDECK_MEDIA_DIRS`.
+- Stems: play with the stems while a track is still being split on the
+  device. The stem keys work as soon as the first stretch is split
+  (they still read "SPLITTING n%"), on the part split so far; past it the
+  track plays as normal, with a short fade where the split has not reached
+  yet. Splitting starts at the top of the track. The enlarged waveform
+  follows the stems once the split is done.
 - iOS: the log is written to `opendeck-log.txt` in the OpenDeck folder (Files
   app → OpenDeck DJ), the previous launch's beside it, capped at 4 MB.
   Before, it went to stderr, which nothing reads without Xcode attached.
@@ -64,6 +109,17 @@ All notable changes to this project will be documented in this file.
   `--screen-only` still override it for one run.
 
 ### Changed
+- Splitting stems on an iPad or iPhone no longer keeps the model (about 4 GB)
+  in memory after the split, so the deck is not carrying it through the rest
+  of the set; the next split loads it again in a few seconds. A device that
+  cannot give a split the memory it needs shows "NEEDS MORE MEMORY" instead
+  of being closed by iOS partway, and downloads nothing.
+- Stems from an OverCue stick play almost at once. The bank is read page by
+  page from the start of the track, each page checked as it arrives, and the
+  deck plays the stems as far as they have got and the track itself beyond
+  that. On a real stick: stems playing 0.15 s after a load, where the whole
+  bank used to be read first (1.5–2 s on a desktop, longer on an iPad). A
+  bank that fails a check partway is dropped and the track plays on.
 - Audio decoding moved to Symphonia 0.6.1.  Checked against 0.5 on 23 files
   (MP3 CBR / VBR / 44.1 kHz and two real tracks, AAC, ALAC, FLAC, WAV, AIFF
   at 16 / 24 / 32-bit and float, Vorbis, 5.1): every format decodes to the
@@ -72,6 +128,44 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- Phase meter: the red bar mark no longer jumps a beat for a frame now and
+  then. On the master's row the beat-in-bar changed when each beat packet
+  arrived, a few ms either side of the beat the row had drawn; it now counts
+  along with the drawn phase. On our own row the phase could round up to a
+  whole beat a frame before the beat number did.
+- rekordbox sticks with cues: a track with any memory or hot cue point
+  failed to read its analysis (the bundled parser took a cue point to be
+  type 0; rekordbox writes 1), so its beat grid was lost as well as its cues.
+  A cue without a comment, and extended cue entries of other lengths, failed
+  the same way. No test stick had cues, so this never showed.
+- rekordbox hot cues landed one pad late: A on B, B on C, and H was dropped.
+- A CDJ-3000 browsing OpenDeck's music now shows each track's key in its
+  track list (the KEY column was empty, though the key showed once the track
+  was loaded). The track rows now have the 16 fields a CDJ-3000 sends for
+  its own tracks, with the key and the tempo. The player also stops asking
+  for every listed track's details one by one.
+- Loops over Pro DJ Link: while the deck loops, the players, mixers and
+  lighting tools following OpenDeck now see it loop. Short loops (½ or 1
+  beat) used to run on through the song over Link, 1–2 beat loops sent no
+  beats at all, and every wrap could send a stray beat from before or after
+  the loop. Now each time round sends the loop's beat once. Details in
+  docs/design/link-loop-timing.md.
+- With `OPENDECK_LINK_IFACE=lo`, Link broadcasts go to 127.255.255.255, so
+  other programs on the machine hear them (Deckbench, a second OpenDeck).
+  `tools/deckbench/loop_beats.py` checks loops over Link on Deckbench.
+- SLIP works with hot cues and scratching: hold a hot cue (or hold the
+  platter in VINYL mode) with SLIP on and the track carries on underneath;
+  letting go returns to where it would have been. Before, SLIP only
+  covered loops.
+- LOOP IN, LOOP OUT and RELOOP act the moment the key is pressed, as on
+  the unit, so a loop point lands where you pressed, not where you lifted.
+- Touch keys on the iPad no longer miss taps: a tap counts when the finger
+  wobbles a little, when it is very quick, and when another finger is
+  already on the jog or the fader (panel tabs such as STEMS / BEAT JUMP,
+  faceplate keys and screen keys).
+- TEMPO RANGE no longer moves the tempo fader. The fader stays where it
+  is and the tempo follows the new range, as on a CDJ: +3 % on ±6 becomes
+  +8 % on ±16.
 - Loading from a linked player: a file the player's library names but its
   NFS export does not resolve by that exact name (a LOOKUP "…" failed, status
   2) is looked up again in the folder's listing ignoring case, and on every

@@ -31,6 +31,7 @@ mod waveform_cpu;
 mod settings;
 mod stems;
 mod separate;
+mod modelfetch;
 mod snapshot;
 mod taglist;
 #[cfg(target_os = "android")]
@@ -94,16 +95,37 @@ const HISTORY_MAX: usize = 100;
 /// Each split logs each step with the memory in use; on iOS also to
 /// `Documents/opendeck-stems-test.txt` (only once a model was put there),
 /// line by line, so a split iOS kills for memory still shows how far it got.
-fn split_on_device(path: &std::path::Path, track: &Arc<Vec<f32>>, sr: u32, job: &separate::Job) -> Result<Option<stems::StemBank>> {
+/// A held SLIP action: where the track was and when; the shadow runs at
+/// `per_sec` interleaved samples a second (the fader's speed) from there.
+#[derive(Clone, Copy, Debug)]
+struct SlipHold { pos: f64, since: Instant, per_sec: f64, hot: Option<u8> }
+
+impl SlipHold {
+    fn shadow(&self, now: Instant) -> f64 { self.pos + now.duration_since(self.since).as_secs_f64() * self.per_sec }
+}
+
+fn split_on_device(path: &std::path::Path, track: &Arc<Vec<f32>>, sr: u32, job: &separate::Job) -> Result<Option<Arc<stems::StemBank>>> {
     use separate::model;
     if !model::present() { return Ok(None); }
     let secs = track.len() as f64 / 2.0 / sr as f64;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mem = || { let (used, left) = model::memory_mb(); format!("mem {used} MB, {left} MB left") };
     split_trace(&format!("{} {} | {name} | {secs:.0}s track | start | {}", utc_now(), model::device(), mem()));
+    // Refuse rather than be killed partway: the model needs ~4.7 GB above
+    // what the deck already uses (measured; see SPLIT_NEEDS_MB).
+    let (_, left) = model::memory_mb();
+    if left < model::SPLIT_NEEDS_MB {
+        split_trace(&format!("  not enough memory: {left} MB left, needs {} MB", model::SPLIT_NEEDS_MB));
+        return Err(separate::NotEnoughMemory { need_mb: model::SPLIT_NEEDS_MB, have_mb: left }.into());
+    }
     let res = model::with(|m| {
         split_trace(&format!("  model ready on {} | {}", model::units(), mem()));
-        separate::separate(track, sr, m, job)
+        // The deck picks this bank up and plays each stretch as it lands.
+        let bank = Arc::new(stems::StemBank::filling(track));
+        let _ = job.bank.set(Arc::clone(&bank));
+        let t = separate::separate(track, sr, m, job, &mut |b| bank.append(b))?;
+        bank.finish(sr);
+        Ok((bank, t))
     });
     let line = match &res {
         Ok(((_, t), load_s)) => format!(
@@ -111,9 +133,27 @@ fn split_on_device(path: &std::path::Path, track: &Arc<Vec<f32>>, sr: u32, job: 
             t.chunks, t.model_s, t.total_s, secs / t.total_s.max(1e-9), mem()),
         Err(e) => format!("  split failed: {e:#} | {}", mem()),
     };
+    // Give the model's memory back: the deck plays on without it, and the
+    // next split loads it again in a few seconds.
+    model::release();
     split_trace(&line);
-    let ((data, _), _) = res?;
-    Ok(Some(stems::StemBank::from_split(track, data, sr)))
+    let ((bank, _), _) = res?;
+    Ok(Some(bank))
+}
+
+/// "IP 192.168.1.23 (en0)  ·  10.0.0.5 (en1)": the device's IPv4
+/// addresses, the one Link sends from first, at most three, leaving out
+/// virtual ones (containers, VPNs, Apple's peer-to-peer links) unless Link
+/// is on one; "IP: no network" with none.
+fn format_ips(ifs: &[(String, std::net::Ipv4Addr)], link: Option<std::net::Ipv4Addr>) -> String {
+    const VIRTUAL: [&str; 12] = ["docker", "br-", "veth", "lxc", "virbr", "tailscale", "utun", "awdl", "llw", "bridge", "anpi", "vmnet"];
+    let mut v: Vec<&(String, std::net::Ipv4Addr)> = ifs.iter()
+        .filter(|(n, ip)| Some(*ip) == link || !VIRTUAL.iter().any(|p| n.starts_with(p)))
+        .collect();
+    v.sort_by_key(|(_, ip)| Some(*ip) != link);
+    v.truncate(3);
+    if v.is_empty() { return "IP: no network".into(); }
+    format!("IP {}", v.iter().map(|(n, ip)| format!("{ip} ({n})")).collect::<Vec<_>>().join("  ·  "))
 }
 
 /// A split's input is ready and its first chunk goes to the model.
@@ -243,10 +283,15 @@ fn serve_grid(link: &prodj::LinkState, path: &std::path::Path, grid: Option<&Bea
 
 /// The cues a peer reads for the loaded track: its hot cues A–H and memory
 /// cues, from interleaved sample positions (`ch` channels at `sr`).
-fn served_cues(hot: &[Option<u64>; 8], memory: &[u64], sr: u32, ch: u32) -> Vec<opendeck_dbserver::server::Cue> {
+fn served_cues(hot: &[Option<u64>; 8], memory: &[u64], looks: &CueLooks, sr: u32, ch: u32) -> Vec<opendeck_dbserver::server::Cue> {
+    use opendeck_dbserver::server::Cue;
     let ms = |pos: u64| (pos as f64 / ch.max(1) as f64 / sr.max(1) as f64 * 1000.0).round() as u32;
-    let mut v: Vec<_> = memory.iter().map(|&p| opendeck_dbserver::server::Cue { hot: 0, ms: ms(p), ..Default::default() }).collect();
-    v.extend(hot.iter().enumerate().filter_map(|(i, c)| c.map(|p| opendeck_dbserver::server::Cue { hot: i as u8 + 1, ms: ms(p), ..Default::default() })));
+    let dress = |c: Cue, l: Option<&CueLook>| match l {
+        Some(l) => Cue { color_code: l.code, rgb: l.rgb, comment: l.comment.clone(), ..c },
+        None => c,
+    };
+    let mut v: Vec<_> = memory.iter().map(|&p| dress(Cue { hot: 0, ms: ms(p), ..Default::default() }, looks.memory_at(p))).collect();
+    v.extend(hot.iter().enumerate().filter_map(|(i, c)| c.map(|p| dress(Cue { hot: i as u8 + 1, ms: ms(p), ..Default::default() }, looks.hot.get(i)))));
     v
 }
 
@@ -390,7 +435,7 @@ mod track_ref_tests {
         let mut hot = [None; 8];
         hot[0] = Some(2 * 1500);
         hot[2] = Some(2 * 250);
-        let cues = super::served_cues(&hot, &[2 * 40], 1000, 2);
+        let cues = super::served_cues(&hot, &[2 * 40], &super::CueLooks::default(), 1000, 2);
         let c = |hot: u8, ms: u32| opendeck_dbserver::server::Cue { hot, ms, ..Default::default() };
         assert_eq!(cues, vec![c(0, 40), c(1, 1500), c(3, 250)]);
         super::update_served(&link, &outside, |t| t.cues = cues.clone());
@@ -404,7 +449,7 @@ mod stream_load_tests {
     use super::*;
 
     /// A 16-bit stereo WAV: `lead` seconds of silence, then a 440 Hz tone.
-    fn wav(path: &std::path::Path, sr: u32, secs: f64, lead: f64) {
+    pub(super) fn wav(path: &std::path::Path, sr: u32, secs: f64, lead: f64) {
         let n = (sr as f64 * secs) as u32;
         let mut d = Vec::new();
         for i in 0..n {
@@ -679,7 +724,16 @@ struct DeckApp {
     /// name being loaded.  The deck keeps running until the bytes arrive.
     fetch_rx:          Option<mpsc::Receiver<LoadMsg>>,
     /// The stems job for the loaded track (see `stems.rs`).
-    stems_rx:          Option<mpsc::Receiver<Result<Option<stems::StemBank>>>>,
+    stems_rx:          Option<mpsc::Receiver<Result<Option<Arc<stems::StemBank>>>>>,
+    /// The loaded track has no prepared stems and the stem model is still
+    /// downloading: split it once the model is in.
+    stems_await_model: bool,
+    /// This device could not give a split the memory it needs.
+    stems_no_memory: bool,
+    /// A split has been started (or refused) for the loaded track.
+    stems_split_tried: bool,
+    /// MENU footer addresses and when they were looked up.
+    ip_cache: (Option<Instant>, String),
     /// An on-device split in progress (progress, cancel), see `separate.rs`.
     stems_job:         Option<Arc<separate::Job>>,
     /// What the enlarged waveform shows now: the stem mix of (bank, gains,
@@ -706,6 +760,10 @@ struct DeckApp {
     /// Hot cues A–H (interleaved sample index, or empty): rekordbox's from the
     /// ANLZ on load, plus any set from the PERFORM pads.  In-session for now.
     hot_cues:          [Option<u64>; 8],
+    /// What rekordbox says about each cue beyond its position: colour and
+    /// comment (hot cues A–H by slot; memory points by position).  A cue set
+    /// on the deck has none.
+    cue_looks:         CueLooks,
     /// PERFORM screen state: pad mode, which bank the four pads show (0 = A–D,
     /// 1 = E–H), and whether DELETE –CALL is armed (next pad tap deletes).
     perform_mode:      PerformMode,
@@ -719,6 +777,9 @@ struct DeckApp {
     /// began, audio.source_consumed then).  Shadow = pos + consumed-since.
     /// Ending the action jumps there; a manual seek cancels it.
     slip_anchor:       Option<(f64, u64)>,
+    /// SLIP for a held action (a hot cue held, the platter held in VINYL),
+    /// where the audio stops counting: the shadow runs in wall time.
+    slip_hold:         Option<SlipHold>,
     exit_after_capture: bool,
     /// Dev script: buttons held (`hold=`), and the lamp report / screenshot
     /// due this frame (`lamps=`, `shot=`).
@@ -793,6 +854,7 @@ struct UiFlags {
     player: u8,
     cue_point: u64,
     hot_cues: [Option<u64>; 8],
+    hot_rgb: [Option<(u8, u8, u8)>; 8],
     perform_mode: PerformMode, perform_bank: u8, perform_delete: bool,
     loop_active: bool, loop_start: u64, loop_end: u64, loop_beats: f32,
     tempo_range: f32, quantize: bool,
@@ -840,6 +902,7 @@ fn make_snapshot<'a>(
         cue_point:     f.cue_point,
         memory_cues,
         hot_cues:      f.hot_cues,
+        hot_rgb:       f.hot_rgb,
         perform_mode:  f.perform_mode,
         perform_bank:  f.perform_bank,
         perform_delete: f.perform_delete,
@@ -868,6 +931,7 @@ fn make_snapshot<'a>(
         master_player: f.master_player,
         player:        f.player,
         link_addr:     String::new(),
+        ip_line:       String::new(),
         link_peers:    String::new(),
         cols_visible:  ZOOM_LEVELS[ZOOM_DEFAULT],
         local_wave: None, remote_wave: None, peers: Vec::new(), info_player: 0, remote_info: None,
@@ -875,6 +939,7 @@ fn make_snapshot<'a>(
         beat2_bpm,
         beat2_phase_beats,
         beat2_beat_in_bar,
+        key_shift:     audio.key_shift.load(Ordering::Relaxed) as i8,
     }
 }
 
@@ -1041,6 +1106,10 @@ impl DeckApp {
             indicators,
             fetch_rx: None,
             stems_rx: None,
+            stems_await_model: false,
+            stems_no_memory: false,
+            stems_split_tried: false,
+            ip_cache: (None, String::new()),
             stems_job: None,
             stem_wave_key: None,
             loading: None,
@@ -1053,11 +1122,13 @@ impl DeckApp {
             memory_cues,
             track_tags,
             hot_cues,
+            cue_looks:         CueLooks::default(),
             perform_mode:      PerformMode::HotCue,
             perform_bank:      0,
             perform_delete:    false,
             loop_beats:        0.0,
             slip_anchor:       None,
+            slip_hold:         None,
             exit_after_capture: false,
             script_held: Vec::new(),
             panel_held: Vec::new(),
@@ -1133,11 +1204,13 @@ impl DeckApp {
                 // is no scrub audio yet, so this is a silent scratch.
                 let vinyl = self.settings.jog_vinyl;
                 if touched && vinyl && self.audio.playing.load(Ordering::Relaxed) {
+                    self.slip_hold_begin(self.smoothed_pos, None);   // SLIP: the track runs on under the scratch
                     self.audio.playing.store(false, Ordering::Relaxed);
                     self.jog_hold_resume = true;
                     log::debug!("jog touch: holding transport (VINYL)");
                 } else if !touched && self.jog_hold_resume {
                     self.jog_hold_resume = false;
+                    self.slip_hold_end(None);
                     self.lock_in_play();
                     log::debug!("jog release: transport resumes");
                 }
@@ -1299,15 +1372,21 @@ impl DeckApp {
                     let ch  = self.audio.channels as u64;
                     let pos = self.quantized(self.smoothed_pos);
                     self.hot_cues[s] = Some(pos);
+                    self.cue_looks.hot[s] = CueLook::default();
                     let sr_ch = self.audio.sample_rate as f64 * ch as f64;
                     log::info!("hot cue {}: set at {:.2}s", (b'A' + slot) as char, pos as f64 / sr_ch);
                     self.serve_deck_cues();
                 }
             }
-            Event::Deck(ControlEvent::HotCueTrigger { slot, .. }) => {
+            Event::Deck(ControlEvent::HotCueRelease { slot }) => self.slip_hold_end(Some(slot)),
+            Event::Deck(ControlEvent::HotCueTrigger { slot, held }) => {
                 // A hot cue is jump + play (latching), unlike momentary CUE.
                 if let Some(pos) = self.hot_cues.get(slot as usize).copied().flatten() {
+                    // SLIP: while the pad is held the track runs on from here;
+                    // letting go returns to where it would be.
+                    let (from, playing) = (self.smoothed_pos, self.audio.playing.load(Ordering::Relaxed));
                     self.seek_to(pos);
+                    if held && playing { self.slip_hold_begin(from, Some(slot)); }
                     self.lock_in_play();
                     log::info!("hot cue {}: play", (b'A' + slot) as char);
                 } else {
@@ -1317,6 +1396,7 @@ impl DeckApp {
             Event::Deck(ControlEvent::HotCueDelete { slot }) => {
                 if let Some(c) = self.hot_cues.get_mut(slot as usize) {
                     *c = None;
+                    self.cue_looks.hot[slot as usize] = CueLook::default();
                     log::info!("hot cue {}: deleted", (b'A' + slot) as char);
                     self.serve_deck_cues();
                 }
@@ -1351,6 +1431,13 @@ impl DeckApp {
                 self.audio.speed_store(s);
                 log::info!("tempo {:+.2}%", (s - 1.0) * 100.0);
             }
+            Event::Deck(ControlEvent::KeyShift { semitones }) => {
+                // KEY SHIFT: the key moves, the tempo does not (CDJ-3000:
+                // ±1 semitone per tap, RESET).  A new track starts unshifted.
+                let s = semitones.clamp(-KEY_SHIFT_MAX, KEY_SHIFT_MAX);
+                self.audio.key_shift.store(s as i32, Ordering::Relaxed);
+                log::info!("key shift {s:+}");
+            }
             Event::Deck(ControlEvent::KeyLockToggle) => {
                 // Master Tempo: on = key lock (time-stretch, pitch held); off =
                 // varispeed (pitch tracks speed). The processor reads this flag.
@@ -1365,6 +1452,7 @@ impl DeckApp {
                     if self.audio.loop_active.load(Ordering::Relaxed) { self.slip_begin(); }
                 } else {
                     self.slip_anchor = None;   // disengaged: no jump, just stop shadowing
+                    self.slip_hold = None;
                 }
                 log::info!("slip {}", if self.slip { "on" } else { "off" });
             }
@@ -1841,7 +1929,7 @@ impl DeckApp {
 
     /// Serve the loaded track's hot and memory cues (see [`served_cues`]).
     fn serve_deck_cues(&self) {
-        let cues = served_cues(&self.hot_cues, &self.memory_cues, self.audio.sample_rate, self.audio.channels as u32);
+        let cues = served_cues(&self.hot_cues, &self.memory_cues, &self.cue_looks, self.audio.sample_rate, self.audio.channels as u32);
         update_served(&self.link, &self.path, |t| t.cues = cues);
     }
 
@@ -1938,6 +2026,27 @@ impl DeckApp {
         }
     }
 
+    /// SLIP on and a held action starts at `from` (interleaved samples):
+    /// shadow from there at the fader's speed.
+    fn slip_hold_begin(&mut self, from: f64, hot: Option<u8>) {
+        if !self.slip || self.slip_hold.is_some() { return; }
+        let speed = f32::from_bits(self.fader_speed.load(Ordering::Relaxed)) as f64;
+        let per_sec = self.audio.sample_rate as f64 * self.audio.channels as f64 * speed;
+        self.slip_anchor = None;
+        self.slip_hold = Some(SlipHold { pos: from.max(0.0), since: Instant::now(), per_sec, hot });
+        log::info!("slip: shadowing from {:.2}s ({})", from / (self.audio.sample_rate as f64 * self.audio.channels as f64),
+                   hot.map_or("scratch".to_string(), |s| format!("hot cue {}", (b'A' + s) as char)));
+    }
+
+    /// The held action `hot` (None: the platter) let go: back to the shadow.
+    fn slip_hold_end(&mut self, hot: Option<u8>) {
+        let Some(h) = self.slip_hold.filter(|h| h.hot == hot) else { return };
+        let ch = self.audio.channels as u64;
+        let target = ((h.shadow(Instant::now()).min(self.audio.len() as f64) as u64) / ch) * ch;
+        self.seek_to(target);
+        log::info!("slip: back to {:.2}s", target as f64 / (self.audio.sample_rate as f64 * ch as f64));
+    }
+
     /// The slip action ended: snap to the shadow and stop shadowing.
     fn slip_end(&mut self) {
         if let Some(shadow) = self.slip_shadow() {
@@ -1973,6 +2082,7 @@ impl DeckApp {
             if pos < s || pos >= e { self.exit_loop(); }
         }
         self.slip_anchor = None;
+        self.slip_hold = None;
         // The seek_request channel is what the processor actually acts on; it
         // can't be clobbered by the processor's own progress store (which lost
         // seeks and made CUE sometimes not return).  `position` is set too, as
@@ -1992,9 +2102,12 @@ impl DeckApp {
     }
 
     /// Same as `grid_from_anlz` but from ANLZ bytes read over the network.
-    fn grid_from_anlz_bytes(bytes: &[u8], deck_sr: u32, ch: u8) -> Option<AnlzLoad> {
-        let a = opendeck_rekordbox::read_anlz_from(&mut std::io::Cursor::new(bytes.to_vec()))
+    fn grid_from_anlz_bytes(bytes: &[u8], ext: Option<&[u8]>, deck_sr: u32, ch: u8) -> Option<AnlzLoad> {
+        let mut a = opendeck_rekordbox::read_anlz_from(&mut std::io::Cursor::new(bytes.to_vec()))
             .map_err(|e| log::warn!("ANLZ (link): {e:#}")).ok()?;
+        if let Some(ext) = ext {
+            if let Err(e) = opendeck_rekordbox::merge_ext(&mut a, &mut std::io::Cursor::new(ext.to_vec())) { log::warn!("ANLZ .EXT (link): {e:#}"); }
+        }
         Self::anlz_to_grid(a, deck_sr, ch)
     }
 
@@ -2009,13 +2122,19 @@ impl DeckApp {
         let to_samples = |ms: u32| (ms as u64 * deck_sr as u64) / 1000 * ch as u64;
         let memory_cues: Vec<u64> = a.memory_cues.iter().map(|c| to_samples(c.time_ms)).collect();
         let cue = memory_cues.first().copied().unwrap_or(0);
+        // rekordbox numbers hot cues from 1 (A); the deck's slots from 0.
         let mut hot_cues = [None; 8];
+        let mut looks = CueLooks::default();
         for c in &a.hot_cues {
-            if let Some(n) = c.hot_cue {
-                if (n as usize) < 8 { hot_cues[n as usize] = Some(to_samples(c.time_ms)); }
+            if let Some(n @ 1..=8) = c.hot_cue {
+                let s = n as usize - 1;
+                hot_cues[s] = Some(to_samples(c.time_ms));
+                looks.hot[s] = CueLook::of(c);
             }
         }
-        Some(AnlzLoad { grid, cue, memory_cues, hot_cues })
+        looks.memory = a.memory_cues.iter().map(|c| (to_samples(c.time_ms), CueLook::of(c)))
+            .filter(|(_, l)| *l != CueLook::default()).collect();
+        Some(AnlzLoad { grid, cue, memory_cues, hot_cues, looks })
     }
 
     /// Dispatch a browser selection: a local file, or a track on a linked player.
@@ -2087,6 +2206,7 @@ impl DeckApp {
                 A::Shot(p) => self.script_shot = Some(p),
                 A::Stems(g) => { for (i, v) in g.iter().enumerate() { self.audio.stems.set_gain(i, *v); } log::info!("script: stems {g:?}"); }
                 A::DeckView => self.events.push(Event::Ui(UiEvent::DeckView)),
+                A::KeyShift(n) => self.apply(Event::Deck(ControlEvent::KeyShift { semitones: n })),
                 A::Quit => { log::info!("script: quit"); log::logger().flush(); std::process::exit(0); }
             }
         }
@@ -2303,7 +2423,11 @@ impl DeckApp {
             let audio = nfs.read_file(&fh, size)?;
             let grid = if analyze_rel.is_empty() { FetchedGrid::None } else {
                 match nfs.lookup_path(&root, &analyze_rel).and_then(|(afh, asz)| nfs.read_file(&afh, asz)) {
-                    Ok(bytes) => FetchedGrid::Anlz(bytes),
+                    Ok(bytes) => {
+                        let ext_rel = std::path::Path::new(&analyze_rel).with_extension("EXT").to_string_lossy().into_owned();
+                        let ext = nfs.lookup_path(&root, &ext_rel).and_then(|(efh, esz)| nfs.read_file(&efh, esz)).ok();
+                        FetchedGrid::Anlz(bytes, ext)
+                    }
                     Err(e) => { log::warn!("link ANLZ {analyze_rel}: {e:#}"); FetchedGrid::None }
                 }
             };
@@ -2394,7 +2518,16 @@ impl DeckApp {
 
     /// Step a MENU setting and apply whatever it controls at runtime.
     fn cycle_setting(&mut self, s: settings::Setting) {
+        let old_range = self.settings.tempo_range;
         self.settings.cycle(s, 1);
+        if s == settings::Setting::TempoRange {
+            // The fader stays put; the tempo follows the new range.
+            let speed = f32::from_bits(self.fader_speed.load(Ordering::Relaxed));
+            let speed = input::speed_after_range_change(speed, old_range, self.settings.tempo_range);
+            self.fader_speed.store(speed.to_bits(), Ordering::Relaxed);
+            self.audio.speed_store(speed);
+            log::info!("tempo range {} → tempo {:+.2}%", settings::Settings::range_label(self.settings.tempo_range), (speed - 1.0) * 100.0);
+        }
         cpumeter::set_file_log(self.settings.perf_log);
         if s == settings::Setting::DeckView { self.apply_deck_view(); }
         if s == settings::Setting::WaveColor { self.apply_wave_color(); }
@@ -2416,9 +2549,19 @@ impl DeckApp {
     fn stems_view(&self) -> snapshot::StemsView {
         use snapshot::StemsState as S;
         let state = if !self.settings.stems { S::Off }
-            else if self.audio.stems.ready_for(&self.audio.current()) { S::Ready }
-            else if let Some(j) = self.stems_job.as_ref().filter(|j| j.progress.load(std::sync::atomic::Ordering::Relaxed) > 0) { S::Splitting(j.percent()) }
+            else if let Some(b) = self.audio.stems.bank().filter(|b| b.is_for(&self.audio.current())) {
+                if b.complete() || b.prepared { S::Ready } else { S::Splitting(b.percent()) }
+            }
             else if self.stems_rx.is_some() { S::Loading }
+            else if self.stems_no_memory { S::NoMemory }
+            else if self.stems_await_model {
+                match modelfetch::state() {
+                    modelfetch::Fetch::Unsupported => S::NoMemory,
+                    modelfetch::Fetch::Failed(_) => S::Waiting,
+                    modelfetch::Fetch::Unpacking | modelfetch::Fetch::Ready => S::Preparing,
+                    f => f.percent().map_or(S::None, S::Downloading),
+                }
+            }
             else { S::None };
         snapshot::StemsView { state, gains: self.audio.stems.gains() }
     }
@@ -2546,17 +2689,29 @@ impl DeckApp {
 
     /// Look for prepared stems for the track just loaded, off the UI
     /// thread.  Local files only for now; LINK loads come in phase 4.
-    /// `OPENDECK_STEMS=0` turns stems off.
-    fn start_stems(&mut self, track: &Arc<Vec<f32>>, ch: usize) {
+    /// `OPENDECK_STEMS=0` turns stems off.  A track without prepared stems
+    /// is not split here: that waits for its STEMS panel ([`Self::stems_wanted`]).
+    fn start_stems(&mut self, track: &Arc<Vec<f32>>, ch: usize) { self.start_stems_job(track, ch, false); }
+
+    /// The stems job: prepared stems if the stick has them, else (with
+    /// `split`) a split on the device, fetching the model first if needed.
+    fn start_stems_job(&mut self, track: &Arc<Vec<f32>>, ch: usize, split: bool) {
         self.stop_stems();
+        self.stems_split_tried = split;
         if !self.settings.stems || std::env::var("OPENDECK_STEMS").is_ok_and(|v| v == "0") || !self.path.is_file() { return; }
+        if split {
+            // First use: fetch the stem model (iOS) in the background; the
+            // split waits for it.
+            modelfetch::ensure();
+            self.stems_await_model = cfg!(target_os = "ios") && !separate::model::present();
+        }
         let (tx, rx) = mpsc::channel();
         let (path, track, sr) = (self.path.clone(), Arc::clone(track), self.audio.sample_rate);
         let job = Arc::new(separate::Job { on_start: Some(split_start_trace), on_chunk: Some(split_chunk_trace), ..Default::default() });
         let j = Arc::clone(&job);
         let spawned = std::thread::Builder::new().name("stems-load".into()).spawn(move || {
-            let got = match stems::load_local(&path, &track, sr, ch) {
-                Ok(None) if ch == 2 => split_on_device(&path, &track, sr, &j),
+            let got = match stems::load_local(&path, &track, sr, ch, Some(&j)) {
+                Ok(None) if ch == 2 && split => split_on_device(&path, &track, sr, &j),
                 r => r,
             };
             let _ = tx.send(got);
@@ -2568,6 +2723,8 @@ impl DeckApp {
     /// its next chunk.
     fn stop_stems(&mut self) {
         self.stems_rx = None;
+        self.stems_await_model = false;
+        self.stems_no_memory = false;
         if let Some(j) = self.stems_job.take() { j.cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
     }
 
@@ -2578,12 +2735,15 @@ impl DeckApp {
         let Some(r) = self.renderer.as_mut() else { return };
         let gains = self.audio.stems.gains();
         let n = self.waveform.columns.len();
-        let bank = self.audio.stems.bank().filter(|b| b.is_for(&self.audio.current()) && gains.iter().any(|g| *g < 1.0));
-        let want = bank.as_ref().map(|b| (Arc::as_ptr(b) as usize, gains.map(f32::to_bits), n));
+        // A bank still being split has no stem waveforms yet: the track's own.
+        let waves = self.audio.stems.bank()
+            .filter(|b| b.is_for(&self.audio.current()) && gains.iter().any(|g| *g < 1.0))
+            .filter(|b| b.waves.get().is_some());
+        let want = waves.as_ref().map(|b| (Arc::as_ptr(b) as usize, gains.map(f32::to_bits), n));
         if want == self.stem_wave_key { return; }
         self.stem_wave_key = want;
-        match bank {
-            Some(b) => r.set_detail(Some(&stems::mix_columns(&b.waves, gains, n))),
+        match waves.as_ref().and_then(|b| b.waves.get()) {
+            Some(w) => r.set_detail(Some(&stems::mix_columns(w, gains, n))),
             None => r.set_detail(None),
         }
         self.request_redraw();
@@ -2591,7 +2751,53 @@ impl DeckApp {
 
     /// Hand a finished stems job to the processor, if its track is still
     /// the one playing.
+    /// The MENU footer's addresses, looked up at most every 2 s (a network
+    /// change shows while MENU is open).
+    /// (Fields, not `&mut self`: the frame holds the renderer borrowed.)
+    fn ip_line(cache: &mut (Option<Instant>, String), link: &prodj::LinkState) -> String {
+        if cache.0.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            let ifs: Vec<(String, std::net::Ipv4Addr)> = if_addrs::get_if_addrs().unwrap_or_default().into_iter()
+                .filter_map(|i| match i.addr { if_addrs::IfAddr::V4(v) if !v.ip.is_loopback() => Some((i.name, v.ip)), _ => None })
+                .collect();
+            let link = link.own_addr.lock().ok().and_then(|a| a.split_whitespace().next().and_then(|ip| ip.parse().ok()));
+            *cache = (Some(Instant::now()), format_ips(&ifs, link));
+        }
+        cache.1.clone()
+    }
+
+    /// The DJ is at the stems: the CDJ-3000 STEMS panel or the XDJ STEMS
+    /// pad mode is open.  That is when a track without prepared stems is
+    /// split, so nobody pays the download, heat or battery for stems they
+    /// never asked for.
+    fn stems_wanted(&self) -> bool {
+        self.settings.stems
+            && (cdj3000::panel(&self.egui_ctx) == cdj3000::Panel::Stems || self.perform_mode == input::PerformMode::Stems)
+    }
+
     fn poll_stems(&mut self) {
+        // The model just finished downloading: split the track that waited.
+        if self.stems_await_model && self.stems_rx.is_none() && modelfetch::state() == modelfetch::Fetch::Ready {
+            self.stems_await_model = false;
+            let (t, ch) = (self.audio.current(), self.audio.channels as usize);
+            if !t.is_empty() { self.start_stems_job(&t, ch, true); }
+            return;
+        }
+        // The stems were opened for a track with none prepared: split it
+        // (once per load; the stick lookup finishes first).
+        if !self.stems_split_tried && self.stems_rx.is_none() && self.stems_wanted()
+            && self.audio.stems.bank().filter(|b| b.is_for(&self.audio.current())).is_none() {
+            let (t, ch) = (self.audio.current(), self.audio.channels as usize);
+            if !t.is_empty() { self.start_stems_job(&t, ch, true); }
+            return;
+        }
+        // A split in progress: play the stems it has written so far.
+        if let Some(b) = self.stems_job.as_ref().and_then(|j| j.bank.get()) {
+            let have = self.audio.stems.bank().is_some_and(|h| Arc::ptr_eq(&h, b));
+            if !have && b.is_for(&self.audio.current()) {
+                self.audio.stems.set_bank(Some(Arc::clone(b)));
+                self.request_redraw();
+            }
+        }
         let Some(rx) = &self.stems_rx else { return };
         let got = match rx.try_recv() {
             Ok(r) => r,
@@ -2599,15 +2805,25 @@ impl DeckApp {
             Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("stems thread died")),
         };
         self.stems_rx = None;
-        self.stems_job = None;
+        let job = self.stems_job.take();
+        if got.is_err() {
+            // A failed split: drop what it had written, back to the track.
+            if let (Some(b), Some(h)) = (job.as_ref().and_then(|j| j.bank.get()), self.audio.stems.bank()) {
+                if Arc::ptr_eq(b, &h) { self.audio.stems.set_bank(None); }
+            }
+        }
         match got {
             Ok(Some(bank)) if bank.is_for(&self.audio.current()) => {
-                self.audio.stems.set_bank(Some(Arc::new(bank)));
+                self.stems_await_model = false;
+                self.audio.stems.set_bank(Some(bank));
                 self.request_redraw();
             }
             Ok(Some(_)) => log::info!("stems: ready for a track no longer loaded; dropped"),
             Ok(None) => {}
-            Err(e) => log::warn!("stems refused: {e:#}"),
+            Err(e) => {
+                if e.downcast_ref::<separate::NotEnoughMemory>().is_some() { self.stems_no_memory = true; }
+                log::warn!("stems refused: {e:#}");
+            }
         }
     }
 
@@ -2634,6 +2850,8 @@ impl DeckApp {
         self.path           = p.path;
         self.memory_cues    = p.memory_cues;
         self.hot_cues       = p.hot_cues;
+        self.audio.key_shift.store(0, Ordering::Relaxed);
+        self.cue_looks      = p.looks;
         self.perform_delete = false;
         if p.total > 0 { self.audio.load_streaming(Arc::clone(&p.samples), p.total, deck_sr, p.ch as u8)?; }
         else { self.audio.load_samples(Arc::clone(&p.samples), deck_sr, p.ch as u8)?; }
@@ -2946,6 +3164,21 @@ impl DeckApp {
         });
     }
 
+    /// The audible position: the decoder's cursor less what is still queued
+    /// in the ring.  Inside an active loop the cursor has already wrapped
+    /// while the loop's tail is still in flight, so walk back MODULO the loop
+    /// (otherwise the estimate lands before loop_start and the playhead
+    /// lurches).
+    fn heard_pos(&self, raw_pos: u64, in_flight: u64) -> f64 {
+        let loop_active = self.audio.loop_active.load(Ordering::Relaxed);
+        let (ls, le) = (self.audio.loop_start.load(Ordering::Relaxed), self.audio.loop_end.load(Ordering::Relaxed));
+        let h = raw_pos as i64 - in_flight as i64;
+        if loop_active && le > ls && h < ls as i64 {
+            let len = (le - ls) as i64;
+            (ls as i64 + ((h - ls as i64) % len + len) % len) as f64
+        } else { h.max(0) as f64 }
+    }
+
     fn render_frame(&mut self) {
         // While occluded (iOS background) don't touch the GPU: the surface is
         // invalid and any acquire/present risks the background scene-update
@@ -3044,13 +3277,7 @@ impl DeckApp {
         // before loop_start and the playhead lurches.
         let loop_active = self.audio.loop_active.load(Ordering::Relaxed);
         let (ls, le) = (self.audio.loop_start.load(Ordering::Relaxed), self.audio.loop_end.load(Ordering::Relaxed));
-        let heard = {
-            let h = raw_pos as i64 - in_flight as i64;
-            if loop_active && le > ls && h < ls as i64 {
-                let len = (le - ls) as i64;
-                (ls as i64 + ((h - ls as i64) % len + len) % len) as f64
-            } else { h.max(0) as f64 }
-        };
+        let heard = self.heard_pos(raw_pos, in_flight);
         // The audible wrap (end → start) is an EXPECTED backward jump: snap the
         // playhead to it instead of riding it out as a transient.
         let wrapped = loop_active && le > ls && (self.smoothed_pos - heard) > (le - ls) as f64 * 0.5;
@@ -3176,7 +3403,8 @@ impl DeckApp {
         // Phase of the peer's row: a phase-locked free-run (see PeerPhase).
         let beat_ms = self.link.beat2_beat_ms.load(Ordering::Relaxed);
         let peer_playing = self.link.beat2_playing.load(Ordering::Relaxed);
-        let beat2_phase_beats = self.beat2_phase.advance(now_ms, beat_ms, beat2_bpm, peer_playing, frame_dt.as_secs_f64());
+        let (beat2_phase_beats, bib_drawn) = self.beat2_phase.advance(now_ms, beat_ms, beat2_bpm, beat2_bib_v, peer_playing, frame_dt.as_secs_f64());
+        let beat2_bib_v = bib_drawn;
         let flags = UiFlags {
             key_lock: self.key_lock, jog_vinyl: self.settings.jog_vinyl, remain_mode: self.remain_mode, auto_cue: self.auto_cue, slip: self.slip,
             sync: self.link.sync.load(Ordering::Relaxed), master: self.link.master.load(Ordering::Relaxed), zoom_grid_mode: self.zoom_grid_mode,
@@ -3198,7 +3426,7 @@ impl DeckApp {
             },
             player: self.link.player(),
             cue_point: self.transport.cue_point,
-            hot_cues: self.hot_cues, perform_mode: self.perform_mode, perform_bank: self.perform_bank, perform_delete: self.perform_delete,
+            hot_cues: self.hot_cues, hot_rgb: self.cue_looks.hot_rgb(), perform_mode: self.perform_mode, perform_bank: self.perform_bank, perform_delete: self.perform_delete,
             loop_active: self.audio.loop_active.load(Ordering::Relaxed),
             loop_start: self.audio.loop_start.load(Ordering::Relaxed),
             loop_end: self.audio.loop_end.load(Ordering::Relaxed),
@@ -3207,12 +3435,14 @@ impl DeckApp {
             slip_shadow,
         };
         let _t_snap = Instant::now();
+        let ip_line = if self.screen_mode == ScreenMode::Menu { Self::ip_line(&mut self.ip_cache, &self.link) } else { String::new() };
         let mut snap = make_snapshot(&self.path, self.beat_grid.as_ref(), &self.memory_cues, &self.track_tags, &self.audio, flags, pos, playing, speed, fader_speed, beat2_bpm, beat2_phase_beats, beat2_bib_v);
         snap.cols_visible = Self::cols_for(self.settings.skin, self.zoom_level);
         if self.screen_mode == ScreenMode::Info {
             snap.link_addr  = self.link.own_addr.lock().map(|a| a.clone()).unwrap_or_default();
             snap.link_peers = self.link.peers_summary();
         }
+        snap.ip_line = ip_line;
         snap.loading = self.loading.as_deref();
         Self::fill_waves(&mut snap, &self.waveform, &self.link, &self.remote, &self.egui_ctx, beat2_player, self.screen_mode == ScreenMode::Info);
         snap.notice = self.notice.as_ref().filter(|(_, until)| Instant::now() < *until).map(|(m, _)| m.as_str());
@@ -3450,7 +3680,7 @@ impl DeckApp {
             },
             player: self.link.player(),
             cue_point: self.transport.cue_point,
-            hot_cues: self.hot_cues, perform_mode: self.perform_mode, perform_bank: self.perform_bank, perform_delete: self.perform_delete,
+            hot_cues: self.hot_cues, hot_rgb: self.cue_looks.hot_rgb(), perform_mode: self.perform_mode, perform_bank: self.perform_bank, perform_delete: self.perform_delete,
             loop_active: self.audio.loop_active.load(Ordering::Relaxed),
             loop_start: self.audio.loop_start.load(Ordering::Relaxed),
             loop_end: self.audio.loop_end.load(Ordering::Relaxed),
@@ -3459,12 +3689,14 @@ impl DeckApp {
             slip_shadow,
         };
         self.indicators.store(surface_bits(&flags, playing, self.transport.cued));
+        let ip_line = if self.screen_mode == ScreenMode::Menu { Self::ip_line(&mut self.ip_cache, &self.link) } else { String::new() };
         let mut snap = make_snapshot(&self.path, self.beat_grid.as_ref(), &self.memory_cues, &self.track_tags, &self.audio, flags, pos, playing, speed, fader_speed, beat2_bpm, beat2_phase_beats, beat2_bib_v);
         snap.cols_visible = Self::cols_for(self.settings.skin, self.zoom_level);
         if self.screen_mode == ScreenMode::Info {
             snap.link_addr  = self.link.own_addr.lock().map(|a| a.clone()).unwrap_or_default();
             snap.link_peers = self.link.peers_summary();
         }
+        snap.ip_line = ip_line;
         snap.loading = self.loading.as_deref();
         Self::fill_waves(&mut snap, &self.waveform, &self.link, &self.remote, &self.egui_ctx, beat2_player, self.screen_mode == ScreenMode::Info);
         snap.notice = self.notice.as_ref().filter(|(_, until)| Instant::now() < *until).map(|(m, _)| m.as_str());
@@ -3526,7 +3758,38 @@ fn set_idle_timer_disabled(disabled: bool) {
 /// What a rekordbox ANLZ contributes to a load: the beat grid, the load cue
 /// (its first memory point), every memory point, and hot cues A–H — all as
 /// interleaved samples.
-struct AnlzLoad { grid: BeatGrid, cue: u64, memory_cues: Vec<u64>, hot_cues: [Option<u64>; 8] }
+/// KEY SHIFT reaches an octave either way.
+pub(crate) const KEY_SHIFT_MAX: i8 = 12;
+
+struct AnlzLoad { grid: BeatGrid, cue: u64, memory_cues: Vec<u64>, hot_cues: [Option<u64>; 8], looks: CueLooks }
+
+/// A cue's colour and comment from rekordbox (see [`opendeck_rekordbox::RbCue`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CueLook {
+    /// rekordbox's colour code: a hot cue's palette index, a memory cue's 1–8.
+    code: u8,
+    /// A hot cue's colour; None = the CDJ default (green).
+    rgb: Option<(u8, u8, u8)>,
+    comment: String,
+}
+
+impl CueLook {
+    fn of(c: &opendeck_rekordbox::RbCue) -> CueLook {
+        CueLook { code: c.color_code, rgb: c.rgb, comment: c.comment.clone() }
+    }
+}
+
+/// The loaded track's cue looks: hot cues by slot, memory points by position.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CueLooks {
+    hot: [CueLook; 8],
+    memory: Vec<(u64, CueLook)>,
+}
+
+impl CueLooks {
+    fn hot_rgb(&self) -> [Option<(u8, u8, u8)>; 8] { std::array::from_fn(|i| self.hot[i].rgb) }
+    fn memory_at(&self, pos: u64) -> Option<&CueLook> { self.memory.iter().find(|(p, _)| *p == pos).map(|(_, l)| l) }
+}
 
 /// A track fetched over the network by a background thread, ready to decode.
 /// The fetched audio: all of it, or a file still downloading that the decoder
@@ -3536,7 +3799,8 @@ struct Fetched { name: String, path: String, audio: AudioSrc, grid: FetchedGrid,
     /// The serving library's title, artist, … (a player's database knows them
     /// when the file's own tags are missing or unread).
     meta: Option<opendeck_dbserver::TrackMeta> }
-enum FetchedGrid { None, Anlz(Vec<u8>), Beats(Vec<opendeck_dbserver::GridBeat>) }
+/// `Anlz`: the `.DAT`, and the `.EXT` beside it when there is one.
+enum FetchedGrid { None, Anlz(Vec<u8>, Option<Vec<u8>>), Beats(Vec<opendeck_dbserver::GridBeat>) }
 
 /// Find a file a player's library names, over NFS.  The player's own export
 /// (`want`, "/C/" for its USB) goes first, then every other export it
@@ -3614,7 +3878,7 @@ impl Prep {
 struct Prepared {
     name: String, path: std::path::PathBuf, tags: opendeck_decode::TrackTags,
     samples: Arc<Vec<f32>>, ch: usize, waveform: WaveformCache,
-    beat_grid: Option<BeatGrid>, cue_pt: u64, memory_cues: Vec<u64>, hot_cues: [Option<u64>; 8],
+    beat_grid: Option<BeatGrid>, cue_pt: u64, memory_cues: Vec<u64>, hot_cues: [Option<u64>; 8], looks: CueLooks,
     grid_src: &'static str, t0: Instant,
     /// Still decoding: the expected length in samples (the rest arrives as
     /// [`Grow`]s).  0 = `samples` is the whole track.
@@ -3670,7 +3934,7 @@ impl Prep {
         let ch = self.deck_ch;
         let grid_cue = match f.grid {
             FetchedGrid::None => None,
-            FetchedGrid::Anlz(bytes) => DeckApp::grid_from_anlz_bytes(&bytes, self.deck_sr, ch),
+            FetchedGrid::Anlz(bytes, ext) => DeckApp::grid_from_anlz_bytes(&bytes, ext.as_deref(), self.deck_sr, ch),
             FetchedGrid::Beats(beats) if !beats.is_empty() => {
                 let a = opendeck_rekordbox::RbAnalysis {
                     beats: beats.iter().map(|b| opendeck_rekordbox::RbBeat { time_ms: b.time_ms, bpm: b.bpm, beat_in_bar: b.beat_in_bar }).collect(),
@@ -3709,9 +3973,9 @@ impl Prep {
         let total_hint = dec.total_frames().map(|f| (f as f64 * deck_sr as f64 / header_sr.max(1) as f64).round() as u64 * ch as u64).unwrap_or(0);
         let per_sec = (deck_sr as usize * ch) as f64;
 
-        let (beat_grid, rb_cue, memory_cues, hot_cues, grid_src) = match grid_cue {
-            Some(AnlzLoad { grid, cue, memory_cues, hot_cues }) => (Some(grid), cue, memory_cues, hot_cues, "rekordbox"),
-            None => (None, 0, Vec::new(), [None; 8], "freedj"),
+        let (beat_grid, rb_cue, memory_cues, hot_cues, looks, grid_src) = match grid_cue {
+            Some(AnlzLoad { grid, cue, memory_cues, hot_cues, looks }) => (Some(grid), cue, memory_cues, hot_cues, looks, "rekordbox"),
+            None => (None, 0, Vec::new(), [None; 8], CueLooks::default(), "freedj"),
         };
         let grid_src = match (&local, grid_src) { (Some(Some(_)), "rekordbox") => "cache", (_, g) => g };
         // AUTO CUE only when rekordbox gave no cue: then the first sound.
@@ -3772,7 +4036,7 @@ impl Prep {
                 let p = Prepared {
                     name: name.clone(), path: path.clone(), tags: tags.clone(),
                     samples: Arc::new(out.clone()), ch, waveform: if eof { wb.snapshot() } else { partial(&wb) },
-                    beat_grid: beat_grid.clone(), cue_pt, memory_cues: memory_cues.clone(), hot_cues,
+                    beat_grid: beat_grid.clone(), cue_pt, memory_cues: memory_cues.clone(), hot_cues, looks: looks.clone(),
                     grid_src, t0, total,
                 };
                 log::info!("load: playable in {} ms ({:.1}s decoded)", t0.elapsed().as_millis(), out.len() as f64 / per_sec);
@@ -4539,8 +4803,71 @@ mod memory_cue_tests {
 }
 
 #[cfg(test)]
+mod ip_line_tests {
+    use super::format_ips;
+
+    #[test]
+    fn the_link_address_comes_first() {
+        let ifs = vec![("en1".to_string(), "10.0.0.5".parse().unwrap()), ("en0".to_string(), "192.168.1.23".parse().unwrap())];
+        assert_eq!(format_ips(&ifs, Some("192.168.1.23".parse().unwrap())), "IP 192.168.1.23 (en0)  ·  10.0.0.5 (en1)");
+        assert_eq!(format_ips(&ifs, None), "IP 10.0.0.5 (en1)  ·  192.168.1.23 (en0)");
+        assert_eq!(format_ips(&[], None), "IP: no network");
+        // Containers and VPNs stay out; at most three.
+        let busy: Vec<(String, std::net::Ipv4Addr)> = ["en0", "docker0", "tailscale0", "br-1a2b", "en1", "en2", "en3"].iter().enumerate()
+            .map(|(i, n)| (n.to_string(), std::net::Ipv4Addr::new(10, 0, 0, i as u8 + 1))).collect();
+        assert_eq!(format_ips(&busy, None), "IP 10.0.0.1 (en0)  ·  10.0.0.5 (en1)  ·  10.0.0.6 (en2)");
+    }
+}
+
+#[cfg(test)]
 mod anlz_grid_tests {
     use super::*;
+
+    /// A rekordbox stick track loads with its hot cues in the right pads (A
+    /// is rekordbox's hot cue 1), in rekordbox's colours, and a player that
+    /// asks us for the cue list gets the colours and comments too.  Setting
+    /// a pad again on the deck makes it a plain (uncoloured) cue.
+    #[test]
+    fn stick_cues_load_in_their_pads_with_colours() {
+        use opendeck_rekordbox::fixtures::{dat_and_ext, pqtz, FxCue};
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("t.wav");
+        super::stream_load_tests::wav(&wav, 48_000, 40.0, 0.0);
+        let red = (0xe6, 0x28, 0x28);
+        let (dat, ext) = dat_and_ext(pqtz(120.0, 0, 80),
+            &[FxCue { ms: 1_000, code: 2, comment: "intro", ..Default::default() }],
+            &[FxCue { hot: 1, ms: 4_000, code: 0x2a, rgb: red, comment: "drop", ..Default::default() },
+              FxCue { hot: 2, ms: 8_000, ..Default::default() },
+              FxCue { hot: 8, ms: 30_000, code: 0x09, rgb: (0, 0xe0, 0xff), ..Default::default() }]);
+        std::fs::write(dir.path().join("ANLZ0000.DAT"), dat).unwrap();
+        std::fs::write(dir.path().join("ANLZ0000.EXT"), ext).unwrap();
+
+        let prep = Prep { deck_sr: deck_harness::SR, deck_ch: 2, auto_cue: true, auto_cue_level_db: -48.0,
+                          cache_dir: dir.path().join("cache"), link: None, load_gen: Arc::new(AtomicU64::new(0)), gen: 0 };
+        let (tx, rx) = mpsc::channel();
+        DeckApp::prepare_local(prep, wav, Some(dir.path().join("ANLZ0000.DAT")), &tx).unwrap();
+        drop(tx);
+        let Some(LoadMsg::Ready(p)) = rx.into_iter().next() else { panic!("loaded") };
+        let mut d = deck_harness::deck(2.0);
+        d.apply_prepared(p).unwrap();
+
+        let at = |secs: f64| Some(deck_harness::deck_samples(secs));
+        assert_eq!(d.hot_cues, [at(4.0), at(8.0), None, None, None, None, None, at(30.0)], "A, B and H in their own pads");
+        assert_eq!(d.cue_looks.hot_rgb(), [Some(red), None, None, None, None, None, None, Some((0, 0xe0, 0xff))]);
+        assert_eq!(d.memory_cues, vec![deck_harness::deck_samples(1.0)]);
+
+        let served = served_cues(&d.hot_cues, &d.memory_cues, &d.cue_looks, d.audio.sample_rate, 2);
+        let a = served.iter().find(|c| c.hot == 1).unwrap();
+        assert_eq!((a.ms, a.rgb, a.color_code, a.comment.as_str()), (4_000, Some(red), 0x2a, "drop"));
+        let m = served.iter().find(|c| c.hot == 0).unwrap();
+        assert_eq!((m.ms, m.color_code, m.comment.as_str()), (1_000, 2, "intro"));
+        assert!(served.iter().find(|c| c.hot == 2).unwrap().rgb.is_none(), "B has no colour: the default green");
+
+        d.send(ControlEvent::HotCueDelete { slot: 0 });
+        d.send(ControlEvent::HotCueSet { slot: 0 });
+        assert!(d.hot_cues[0].is_some());
+        assert_eq!(d.cue_looks.hot_rgb()[0], None, "a pad set on the deck is a plain cue");
+    }
     // Gated: OPENDECK_TEST_RB=/run/media/dan/CDJ1
     #[test]
     fn grid_from_anlz_matches_rekordbox() {
@@ -4720,4 +5047,285 @@ fn start_media_server(root: &std::path::Path, player: opendeck_dbserver::server:
     log::info!("media server: {n} tracks under {} — nfs portmap {} nfsd {}, dbserver {}", root.display(), nfs.portmap, nfs.nfsd, db.db_port);
     opendeck_mediaserver::start_analysis(scanned.library, scanned.files, Some(link_cache_dir()))?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod slip_hold_tests {
+    use super::*;
+
+    /// A held SLIP action's shadow runs on at the fader's speed: 2 s held
+    /// at 48 kHz stereo, +10 %, from 10 s, lands at 12.2 s.
+    #[test]
+    fn the_shadow_runs_at_the_fader_speed() {
+        let t0 = Instant::now();
+        let per_sec = 48_000.0 * 2.0 * 1.1;
+        let h = SlipHold { pos: 10.0 * 96_000.0, since: t0, per_sec, hot: Some(0) };
+        let at = h.shadow(t0 + Duration::from_secs(2)) / 96_000.0;
+        assert!((at - 12.2).abs() < 1e-9, "{at}");
+        assert_eq!(h.shadow(t0), h.pos);
+    }
+}
+
+/// A whole deck with no window and no sound card, for tests of what the
+/// user sees: send it the events a key or pad sends, let it play in real
+/// time, read the deck state back.  The audio is the real processor and
+/// stretcher; a stand-in device pulls the output at real time.
+#[cfg(test)]
+pub(crate) mod deck_harness {
+    use super::*;
+
+    pub const SR: u32 = 48_000;
+
+    /// A deck holding `secs` of a 120 BPM click track (a beat every 0.5 s),
+    /// paused at the start, with QUANTIZE off unless a test turns it on.
+    pub fn deck(secs: f64) -> DeckApp {
+        static DATA: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = DATA.get_or_init(|| {
+            let d = tempfile::tempdir().unwrap();
+            std::env::set_var("XDG_DATA_HOME", d.path());   // settings / tags never touch the real ones
+            d
+        });
+        let frames = (secs * SR as f64) as usize;
+        let samples: Vec<f32> = (0..frames).flat_map(|n| {
+            let v = if n % (SR as usize / 2) < 200 { 0.5 } else { 0.01 };
+            [v, v]
+        }).collect();
+        let audio = AudioHandle::open_test(samples, SR).unwrap();
+        let grid = BeatGrid::new_constant(0, 120.0);
+        let (_tx, rx) = mpsc::channel();
+        let mut settings = settings::Settings { quantize: false, ..Default::default() };
+        settings.stems = false;
+        let mut d = DeckApp::new(
+            dir.path().join("none.wav"), Some(dir.path().to_path_buf()),
+            WaveformCache { columns: Vec::new(), sample_rate: SR, hop_size: 512 },
+            audio, Some(grid.clone()),
+            Arc::new(AtomicU32::new(1f32.to_bits())), Arc::new(AtomicU32::new(0)), Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)),
+            prodj::LinkState::new(4), Arc::new(arc_swap::ArcSwap::from_pointee(Some(grid))),
+            Arc::new(AtomicBool::new(false)), rx, Arc::new(surface::Indicators::default()), settings,
+        );
+        d.tick();
+        d
+    }
+
+    impl DeckApp {
+        /// What a frame does to the playhead, without drawing: follow the
+        /// audible position.
+        pub fn tick(&mut self) {
+            let raw = self.audio.position.load(Ordering::Relaxed);
+            let fl = self.audio.in_flight.load(Ordering::Relaxed);
+            self.smoothed_pos = self.heard_pos(raw, fl);
+        }
+
+        /// Let the deck run for `secs`, ticking as frames would.
+        pub fn run(&mut self, secs: f64) {
+            let end = Instant::now() + Duration::from_secs_f64(secs);
+            while Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+                self.tick();
+            }
+        }
+
+        /// Send one control event, as a key, pad or controller would.
+        pub fn send(&mut self, e: ControlEvent) { self.apply(Event::Deck(e)); self.tick(); }
+
+        /// The audible position in seconds.
+        pub fn at(&self) -> f64 { self.smoothed_pos / (SR as f64 * 2.0) }
+        /// Seconds → interleaved samples.
+        pub fn samples(secs: f64) -> u64 { (secs * SR as f64) as u64 * 2 }
+    }
+
+    /// Seconds → interleaved samples at the harness rate.
+    pub fn deck_samples(secs: f64) -> u64 { DeckApp::samples(secs) }
+}
+
+/// The deck's controls end to end, through the harness: each test is what a
+/// DJ does and what they hear.
+#[cfg(test)]
+mod deck_tests {
+    use super::deck_harness::*;
+    use super::*;
+    use opendeck_protocol::ControlEvent as C;
+
+    /// Load time, end to end: LOAD the bundled 8:47 MP3 through the real
+    /// loader thread into a 48 kHz deck (so it is resampled, as on most
+    /// devices).  It must be playable — PLAY moves the playhead — within
+    /// `BUDGET_MS`, long before the whole track is in.  Measured on a desktop
+    /// debug build: playable in ~20–35 ms, whole track in ~1 s.  The budget
+    /// leaves room for slow CI machines; a regression to decoding the whole
+    /// track first (seconds) still fails it.  Times print with --nocapture.
+    #[test]
+    fn a_long_mp3_is_playable_within_the_load_budget() {
+        const BUDGET_MS: u128 = 500;
+        let mp3 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../amplificate.mp3");
+        let mut d = deck(2.0);
+        let t0 = Instant::now();
+        d.load_track(&mp3, None).unwrap();
+        let mut playable = None;
+        while d.fetch_rx.is_some() && t0.elapsed() < Duration::from_secs(60) {
+            d.poll_fetch();
+            if playable.is_none() && d.loading.is_none() && d.path == mp3 { playable = Some(t0.elapsed()); }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let whole = t0.elapsed();
+        let playable = playable.expect("the track became playable");
+        eprintln!("load: playable in {} ms, whole track in {} ms", playable.as_millis(), whole.as_millis());
+        assert!(d.audio.complete.load(Ordering::Relaxed), "the whole track streamed in");
+        let secs = d.audio.len() as f64 / (SR as f64 * 2.0);
+        assert!((secs - 527.3).abs() < 1.0, "8:47 at the deck rate: {secs:.1}s");
+        assert!(playable.as_millis() < BUDGET_MS, "playable in {} ms (budget {BUDGET_MS} ms)", playable.as_millis());
+        assert!(playable * 4 < whole, "playable ({} ms) well before the whole track ({} ms)", playable.as_millis(), whole.as_millis());
+
+        // And it plays from the cue.
+        let cue = d.at();
+        d.send(C::PlayPause);
+        d.run(0.3);
+        assert!(d.at() > cue + 0.1, "PLAY moves the playhead: {cue:.2}s → {:.2}s", d.at());
+    }
+
+    /// Loading a track never splits it: the split waits until the DJ opens
+    /// the stems (here the XDJ's STEMS pad mode), then starts once.
+    #[test]
+    fn a_split_waits_for_the_stems_to_be_opened() {
+        let mut d = deck(2.0);
+        d.settings.stems = true;
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("t.wav");
+        super::stream_load_tests::wav(&wav, SR, 6.0, 0.0);
+        let prep = Prep { deck_sr: SR, deck_ch: 2, auto_cue: false, auto_cue_level_db: -48.0,
+                          cache_dir: dir.path().join("cache"), link: None, load_gen: Arc::new(AtomicU64::new(0)), gen: 0 };
+        let (tx, rx) = mpsc::channel();
+        DeckApp::prepare_local(prep, wav, None, &tx).unwrap();
+        drop(tx);
+        let Some(LoadMsg::Ready(p)) = rx.into_iter().next() else { panic!("loaded") };
+        d.apply_prepared(p).unwrap();
+        let t = d.audio.current();
+        d.start_stems(&t, 2);
+        for _ in 0..200 { d.poll_stems(); if d.stems_rx.is_none() { break; } std::thread::sleep(Duration::from_millis(5)); }
+        assert!(!d.stems_split_tried, "no split on load");
+        d.poll_stems();
+        assert!(!d.stems_split_tried, "still none with the stems closed");
+        d.perform_mode = PerformMode::Stems;
+        d.poll_stems();
+        assert!(d.stems_split_tried, "opening the stems starts the split");
+    }
+
+    /// KEY SHIFT sets the audio's semitones (an octave at most), leaves the
+    /// tempo alone, and a new track starts in its own key.
+    #[test]
+    fn key_shift_moves_the_key_not_the_tempo_and_resets_on_load() {
+        let mut d = deck(2.0);
+        let speed = d.audio.speed.load(Ordering::Relaxed);
+        d.send(C::KeyShift { semitones: 2 });
+        assert_eq!(d.audio.key_shift.load(Ordering::Relaxed), 2);
+        assert_eq!(d.audio.speed.load(Ordering::Relaxed), speed, "tempo untouched");
+        d.send(C::KeyShift { semitones: -40 });
+        assert_eq!(d.audio.key_shift.load(Ordering::Relaxed), -12, "an octave down at most");
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("t.wav");
+        super::stream_load_tests::wav(&wav, SR, 6.0, 0.0);
+        let prep = Prep { deck_sr: SR, deck_ch: 2, auto_cue: false, auto_cue_level_db: -48.0,
+                          cache_dir: dir.path().join("cache"), link: None, load_gen: Arc::new(AtomicU64::new(0)), gen: 0 };
+        let (tx, rx) = mpsc::channel();
+        DeckApp::prepare_local(prep, wav, None, &tx).unwrap();
+        drop(tx);
+        let Some(LoadMsg::Ready(p)) = rx.into_iter().next() else { panic!("loaded") };
+        d.apply_prepared(p).unwrap();
+        assert_eq!(d.audio.key_shift.load(Ordering::Relaxed), 0, "a new track is in its own key");
+    }
+
+    fn near(got: f64, want: f64, what: &str) {
+        assert!((got - want).abs() < 0.15, "{what}: at {got:.2}s, want {want:.2}s");
+    }
+
+    #[test]
+    fn slip_returns_after_a_held_hot_cue_and_not_without_slip() {
+        let mut d = deck(30.0);
+        d.send(C::Play);
+        d.run(1.0);
+        d.send(C::HotCueSet { slot: 0 });
+        let cue = d.at();
+        d.run(1.0);
+        // SLIP on: hold A for a second, let go: back where the track would be.
+        d.send(C::SlipToggle);
+        let before = d.at();
+        d.send(C::HotCueTrigger { slot: 0, held: true });
+        near(d.at(), cue, "the pad jumps to its cue");
+        d.run(1.0);
+        d.send(C::HotCueRelease { slot: 0 });
+        near(d.at(), before + 1.0, "SLIP: release returns to the shadow");
+        // SLIP off: the hot cue latches, the release changes nothing.
+        d.send(C::SlipToggle);
+        d.send(C::HotCueTrigger { slot: 0, held: true });
+        d.run(0.5);
+        d.send(C::HotCueRelease { slot: 0 });
+        near(d.at(), cue + 0.5, "no SLIP: plays on from the cue");
+    }
+
+    #[test]
+    fn slip_returns_after_a_loop() {
+        let mut d = deck(30.0);
+        d.send(C::Play);
+        d.run(1.0);
+        d.send(C::SlipToggle);
+        d.send(C::LoopIn);
+        let start = d.at();
+        d.run(0.5);
+        d.send(C::LoopOut);
+        let out = d.at();
+        d.run(1.5);
+        assert!(d.at() >= start - 0.05 && d.at() <= out + 0.05, "looping between {start:.2} and {out:.2}, at {:.2}", d.at());
+        d.send(C::Reloop);   // exit
+        near(d.at(), out + 1.5, "SLIP: the loop's exit returns to the shadow");
+    }
+
+    #[test]
+    fn slip_returns_after_a_vinyl_scratch() {
+        let mut d = deck(30.0);
+        d.settings.jog_vinyl = true;
+        d.send(C::Play);
+        d.run(1.0);
+        d.send(C::SlipToggle);
+        let before = d.at();
+        d.send(C::JogTouch { touched: true });
+        d.run(1.0);
+        d.send(C::JogTouch { touched: false });
+        near(d.at(), before + 1.0, "SLIP: the platter's release returns to the shadow");
+        assert!(d.audio.playing.load(Ordering::Relaxed), "and plays on");
+    }
+
+    #[test]
+    fn a_manual_loop_plays_between_in_and_out() {
+        let mut d = deck(30.0);
+        d.send(C::Play);
+        d.run(1.0);
+        d.send(C::LoopIn);
+        let start = d.at();
+        d.run(0.6);
+        d.send(C::LoopOut);
+        let out = d.at();
+        assert!(d.audio.loop_active.load(Ordering::Relaxed), "OUT closes the loop");
+        let mut seen_wrap = false;
+        for _ in 0..30 {
+            d.run(0.05);
+            assert!(d.at() >= start - 0.05 && d.at() <= out + 0.05, "inside the loop: {:.2} not in {start:.2}..{out:.2}", d.at());
+            if d.at() < start + 0.2 { seen_wrap = true; }
+        }
+        assert!(seen_wrap, "the loop went round");
+    }
+
+    #[test]
+    fn tempo_range_keeps_the_fader_still() {
+        let mut d = deck(5.0);
+        d.send(C::TempoFader { position: 0.25 });   // half way down
+        let fader = |d: &DeckApp| input::speed_to_fader(f32::from_bits(d.fader_speed.load(Ordering::Relaxed)), d.settings.tempo_range);
+        let before = fader(&d);
+        for _ in 0..4 {
+            d.apply(Event::Ui(UiEvent::CycleSetting(settings::Setting::TempoRange)));
+            assert!((fader(&d) - before).abs() < 1e-4, "fader moved on range {}", d.settings.tempo_range);
+            let pct = (f32::from_bits(d.fader_speed.load(Ordering::Relaxed)) - 1.0) * 100.0;
+            let want = if d.settings.tempo_range >= 0.99 { 50.0 } else { d.settings.tempo_range * 50.0 };
+            assert!((pct - want).abs() < 0.01, "tempo follows the range: {pct}% on {}", d.settings.tempo_range);
+        }
+    }
 }

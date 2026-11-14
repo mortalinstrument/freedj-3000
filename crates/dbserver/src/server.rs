@@ -124,14 +124,32 @@ pub fn name_id(name: &str) -> u32 {
     match h { 0 => 1, 0xffff_ffff => 0xffff_fffe, h => h }
 }
 
-/// A menu row (`0x4101`): parent, id, len1, label1, len2, label2, type, flags,
-/// artwork, position, 0, 0.
+/// A menu row (`0x4101`) as a CDJ-3000 sends it, 16 fields: parent, id,
+/// len1, label1, len2, label2, type, flags, artwork, then four numbers, len3,
+/// label3 and one more number.  Only track rows fill the tail
+/// ([`track_row`]); every other row leaves it 0, "" and 0, as captured.
 fn row(parent: u32, id: u32, label: &str, label2: &str, item_type: u32, art: u32) -> Vec<Field> {
-    vec![u(parent), u(id), slen(label), s(label), slen(label2), s(label2), u(item_type), u(0), u(art), u(0), u(0), u(0)]
+    vec![u(parent), u(id), slen(label), s(label), slen(label2), s(label2), u(item_type), u(0), u(art),
+         u(0), u(0), u(0), u(0), slen(""), s(""), u(0)]
 }
 
+/// A track in a list, shaped as a CDJ-3000 lists the tracks on its stick
+/// (captured 2026-11-14, a CDJ-3000 3.22 browsing another's TRACK list):
+/// type 0x10004 with flag 0x0100_0000, then 1, 0x100, the key's id
+/// ([`key_id`]) twice (a player sends its database's key row id second, the
+/// same id its metadata 0x000f row carries), the key's name as label 3 and
+/// the tempo ×100 last.  A CDJ-3000 fills its KEY and BPM columns from these
+/// fields, not from the track's metadata: with the 12-field row we sent,
+/// the KEY column stayed empty.  Label 2 keeps the artist, which our own
+/// LINK browser shows (a CDJ sends it empty and ignores it).
 fn track_row(t: &Track, label: &str) -> Vec<Field> {
-    row(0, t.id, label, &t.artist, 0x0004, if t.has_art { t.id } else { 0 })
+    let key = key_id(&t.key);
+    let key_name = key.map(|k| KEYS[k as usize - 1]).unwrap_or("");
+    let mut r = row(0, t.id, label, &t.artist, 0x0001_0004, if t.has_art { t.id } else { 0 });
+    r[7] = u(0x0100_0000);
+    r[9..16].clone_from_slice(&[u(1), u(0x100), u(key.unwrap_or(0)), u(key.unwrap_or(0)), slen(key_name), s(key_name),
+                                u((t.bpm * 100.0).round() as u32)]);
+    r
 }
 
 /// Distinct non-empty names as (id, name), sorted by name.
@@ -298,7 +316,7 @@ fn menu_rows(lib: &Library, kind_: u16, args: &[Field]) -> Option<Vec<Vec<Field>
                 row(0, name_id(&t.album), &t.album, "", 0x0002, 0),
                 row(0, t.duration_s, "", "", 0x000b, 0),
                 row(0, (t.bpm * 100.0).round() as u32, "", "", 0x000d, 0),
-                row(0, 0, &t.key, "", 0x000f, 0),
+                row(0, key_id(&t.key).unwrap_or(0), &t.key, "", 0x000f, 0),
                 row(0, 0, "", "", 0x000a, 0),
                 row(0, 0, "", "", 0x0013, 0),
                 row(0, 0, "", "", 0x0006, 0),
@@ -419,13 +437,17 @@ pub fn no_data(txid: u32, req: u16) -> Message {
 
 /// A hot cue (`hot` 1–8 = A–H) or memory cue (`hot` 0), in milliseconds;
 /// with `loop_end_ms` it is a loop.  `rgb` is the hot cue's colour (None:
-/// green, a loop orange, as a CDJ-3000 colours its own).
+/// green, a loop orange, as a CDJ-3000 colours its own).  `color_code` is
+/// rekordbox's colour number: a hot cue's palette index, a memory cue's
+/// colour 1–8 (0 = none).  `comment` is the DJ's comment.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cue {
     pub hot:         u8,
     pub ms:          u32,
     pub loop_end_ms: Option<u32>,
     pub rgb:         Option<(u8, u8, u8)>,
+    pub color_code:  u8,
+    pub comment:     String,
 }
 
 /// Milliseconds to the half-frames (1/150 s) of the plain cue list.
@@ -475,21 +497,30 @@ fn ext_cue_list(txid: u32, cues: &[Cue]) -> Option<Message> {
     mem.sort_by_key(|c| c.ms);
     let mut blob = Vec::new();
     for c in hot.iter().chain(mem.iter()) {
-        let size = if c.hot != 0 { 0x54 } else { 0x4c };
-        let mut e = vec![0u8; size];
-        e[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+        // The fixed head (0x4a bytes), then the comment, then the tail: a
+        // hot cue's colour code and RGB sit after the comment (Beat Link reads
+        // them at 0x4e + the comment's length).
+        let mut e = vec![0u8; 0x4a];
         e[4..6].copy_from_slice(&(c.hot as u16).to_le_bytes());
         e[6] = if c.loop_end_ms.is_some() { 2 } else { 1 };
         e[0x0a..0x0c].copy_from_slice(&1000u16.to_le_bytes());
         e[0x0c..0x10].copy_from_slice(&c.ms.to_le_bytes());
         e[0x10..0x14].copy_from_slice(&c.loop_end_ms.unwrap_or(u32::MAX).to_le_bytes());
         e[0x20..0x34].fill(0xff);
+        if c.hot == 0 && c.color_code != 0 { e[0x22] = c.color_code; }
         e[0x34] = if c.hot != 0 { 0x1a } else { 0x12 };
+        let mut comment: Vec<u8> = c.comment.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        if !comment.is_empty() { comment.extend([0, 0]); }
+        e[0x48..0x4a].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        e.extend(&comment);
         if c.hot != 0 {
-            e[0x4a] = 4;
             let (r, g, b) = c.rgb.unwrap_or(if c.loop_end_ms.is_some() { (0xff, 0x8c, 0) } else { (0, 0xff, 0) });
-            e[0x4f..0x52].copy_from_slice(&[r, g, b]);
+            e.extend([4, 0, 0, 0, c.color_code, r, g, b, 0, 0]);
+        } else {
+            e.extend([0, 0]);
         }
+        let size = e.len() as u32;
+        e[0..4].copy_from_slice(&size.to_le_bytes());
         blob.extend(e);
     }
     let n = (hot.len() + mem.len()) as u32;
@@ -783,6 +814,46 @@ mod tests {
         assert_eq!(menu_rows(&lib(), 0x1400, &[dmst(), u(0), u(0)]).unwrap().len(), 5, "sort choices");
     }
 
+    /// A track row as a CDJ-3000 sends one, byte for byte (captured
+    /// 2026-11-14: "About It", Em, 126 BPM, from a CDJ-3000 3.22's TRACK
+    /// list), but for the two ids that are the player's own database rows:
+    /// its artwork id and its key row id.
+    #[test]
+    fn track_rows_match_a_cdj3000() {
+        let t = Track { id: 0x52, title: "About It".into(), key: "Em".into(), bpm: 126.0, ..Default::default() };
+        let mut r = track_row(&t, &t.title);
+        assert_eq!((r.len(), r[11].as_u32(), r[12].as_u32()), (16, 17, 17), "16 fields; Em is key 17");
+        r[8] = u(0x50);
+        r[12] = u(5);
+        let got = Message { txid: 0xc, kind: kind::MENU_ITEM, args: r }.encode();
+        assert_eq!(got, unhex("11872349ae110000000c1041010f10140000001006060602060206060606060606060206110000000011000000521100000012260000000900410062006f0075007400200049007400001100000002260000000100001100010004110100000011000000501100000001110000010011000000111100000005110000000626000000030045006d00001100003138"));
+        // No key: id 0 and an empty label, as a player's no-key metadata row.
+        let r = track_row(&Track { id: 1, title: "x".into(), ..Default::default() }, "x");
+        assert_eq!((r[11].as_u32(), r[14].as_str(), r[15].as_u32()), (0, "", 0));
+        // Every other row has the same 16-field shape, its tail empty.
+        let root = menu_rows(&lib(), kind::ROOT_MENU, &[dmst(), u(0), u(0)]).unwrap();
+        assert!(root.iter().all(|r| r.len() == 16 && r[13] == slen("") && r[15] == u(0)));
+    }
+
+    /// The KEY and BPM columns of a CDJ-3000's track list come from the
+    /// rows: a player browsing us over the wire reads each track's key and
+    /// tempo in the list itself (they were missing; the KEY column stayed
+    /// empty for every track we served).
+    #[test]
+    fn a_player_browsing_us_reads_key_and_tempo_in_the_track_list() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut lib = lib();
+        for (t, (k, bpm)) in lib.tracks.iter_mut().zip([("Am", 124.0), ("F#", 128.5), ("", 0.0)]) { t.key = k.into(); t.bpm = bpm; }
+        let lib = lib.shared();
+        thread::spawn(move || { let (c, _) = l.accept().unwrap(); let _ = serve_client(lib, Arc::new(|| 3), c); });
+        let mut c = crate::Client::connect(Ipv4Addr::LOCALHOST, port, 2).unwrap();
+        let rows = c.all_tracks(Slot::Usb, 0).unwrap();
+        let got: Vec<_> = rows.iter().map(|r| (r.label.as_str(), r.key.as_str(), r.bpm_x100, r.item_type)).collect();
+        assert_eq!(got, [("Alpha", "F#", 12850, 0x10004), ("Beta", "Am", 12400, 0x10004), ("Gamma", "", 0, 0x10004)]);
+        assert_eq!(rows[0].type_name(), "track");
+    }
+
     #[test]
     fn tracks_sort_by_title_and_filenames_by_name() {
         let by_title = items(menu_rows(&lib(), kind::ALL_TRACKS, &[dmst(), u(0)]).unwrap());
@@ -906,5 +977,41 @@ mod tests {
         assert_eq!(&got[0x4f..0x52], &[0, 0xff, 0]);
         assert_eq!(&got[0xa8 + 0x4f..0xa8 + 0x52], &[0xff, 0x8c, 0]);
         assert!(ext_cue_list(3, &[]).is_none(), "no cues: 'no data', as a CDJ answers");
+    }
+
+    /// rekordbox's colours and comments go where Beat Link (and a CDJ) read
+    /// them: a memory cue's colour at 0x22; the comment's length at 0x48, the
+    /// comment (UTF-16LE + 0x0000) at 0x4a, and a hot cue's colour code and
+    /// RGB after it, at 0x4e + the comment's length.
+    #[test]
+    fn extended_cue_list_carries_colours_and_comments() {
+        let cues = vec![
+            Cue { hot: 1, ms: 10_000, rgb: Some((0xe6, 0x28, 0x28)), color_code: 0x2a, comment: "drop".into(), ..Default::default() },
+            Cue { hot: 2, ms: 30_000, ..Default::default() },
+            Cue { hot: 0, ms: 1_500, color_code: 2, comment: "intro".into(), ..Default::default() },
+        ];
+        let m = ext_cue_list(1, &cues).unwrap();
+        let Field::Blob(b) = m.args[3].clone() else { panic!() };
+        // Walk it as Beat Link's parseNxs2Entries does.
+        let mut seen = Vec::new();
+        let mut off = 0;
+        for _ in 0..m.args[4].as_u32() {
+            let e = &b[off..];
+            let size = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
+            let n = u16::from_le_bytes([e[0x48], e[0x49]]) as usize;
+            let comment = if n > 0 {
+                let u: Vec<u16> = e[0x4a..0x4a + n - 2].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                String::from_utf16(&u).unwrap()
+            } else { String::new() };
+            let colour = if e[4] == 0 { (e[0x22], None) } else { (e[0x4e + n], Some((e[0x4f + n], e[0x50 + n], e[0x51 + n]))) };
+            seen.push((e[4], u32::from_le_bytes(e[12..16].try_into().unwrap()), comment, colour, size));
+            off += size;
+        }
+        assert_eq!(off, b.len(), "entry sizes add up");
+        assert_eq!(seen, vec![
+            (1, 10_000, "drop".to_string(), (0x2a, Some((0xe6, 0x28, 0x28))), 0x54 + 10),
+            (2, 30_000, String::new(),      (0, Some((0, 0xff, 0))), 0x54),
+            (0, 1_500,  "intro".to_string(), (2, None), 0x4c + 12),
+        ]);
     }
 }

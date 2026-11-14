@@ -1,15 +1,32 @@
 # Stems split on the device
 
 Status, 2026-11-14: a test build. Linux desktop runs it end to end; the
-iPad build is written but has not run on an iPad yet. Off unless a model is
+iPad Air 13" splits on 0.3.13 (with the increased memory limit). Off unless a model is
 supplied. Code: `crates/app/src/separate.rs`, shim in `ios/freedj/main.m`.
 
 ## What it does
 
-A track loaded with MENU → STEMS on, and no OverCue stems on its stick, is
-split by a separation model on the deck itself. The stem keys read
-"SPLITTING n%", then the stems play through the same engine as OverCue's
-(`stems.rs`): the model's output becomes an ordinary `StemBank`.
+A track with no OverCue stems on its stick is split by a separation model on
+the deck itself, starting when its STEMS panel (or the XDJ screen's STEMS
+pad mode) is opened; loading a track never starts a split. STEMS is on by
+default since 2026-11-14. The stems play through the
+same engine as OverCue's (`stems.rs`): the model's output becomes an
+ordinary `StemBank`.
+
+**Playing while it splits.** Once the model is loaded the split publishes
+an empty bank (`StemBank::filling`, through `Job::bank`) and writes each
+finished stretch into it, in order from the top of the track; `ready`
+marks how far it has got. The stem keys work from then on and read
+"SPLITTING n%" (n is the bank's written share). The processor plays the
+stems below `ready` and the original above it. It decides per block, one
+block ahead: a block whose next block would reach past `ready` ramps the
+mix back to the original, so the fade runs over written stems and never
+steps at the edge, and the stems ramp back in once the split is a block
+ahead again. The samples are `AtomicI16` (relaxed loads cost the same as
+plain ones) with a release/acquire `ready`, so the audio thread reads while
+the split writes, with no lock and no copy. The stems' waveforms are built
+when the split finishes; until then the enlarged waveform is the track's.
+A failed split drops its partial bank.
 
 ## Model
 
@@ -111,9 +128,21 @@ the first chunk and reads `opendeck-stems.conf` in the OpenDeck folder
 
 - Run on the iPad: speed, memory, and whether iOS kills the app.
 - Cache splits, so a track is split once.
-- Fill the bank as chunks finish, from the cue point, so stems are usable
-  seconds after a load instead of after the whole split.
-- Getting the model onto the device: today by hand (Files app); a release
-  would download it on first use, with consent.
-- Memory: the iPad may need the increased-memory-limit entitlement, or a
-  smaller chunk.
+- Split from the cue point (or the playhead) first instead of the top, so
+  the stems are under the playhead sooner on a long intro.
+- ~~Getting the model onto the device~~ done 2026-11-14 (`modelfetch.rs`):
+  downloaded the first time STEMS is on, from a pinned Hugging Face
+  revision, size and SHA-256 checked, unzipped as a stream (9.5 MB peak for
+  the 423 MB weights), installed atomically in Application Support, excluded
+  from backup. The model is picked from a catalogue by the device's memory
+  limit; one entry today, room for a lighter one for smaller devices. The
+  download restarts from scratch if iOS suspends the app partway (a
+  background `NSURLSession` would continue it; not done).
+- Memory: since 2026-11-14 the model is released after each split (it used
+  to stay loaded for the session), and a split needs `SPLIT_NEEDS_MB`
+  (4.6 GB) free or is refused with "NEEDS MORE MEMORY" rather than killed.
+  That figure comes from the one iPad failure (0.3.12, standard limit:
+  killed in the first chunk with 4.2 GB left after the model loaded); the
+  peak of a successful iPad split (0.3.13+, CPU + GPU) is not recorded yet
+  and should replace it. (The 548 → 5219 MB run sometimes quoted is Linux,
+  ONNX Runtime on the CPU, not the iPad.)
