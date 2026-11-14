@@ -72,6 +72,8 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- TAG TRACK / REMOVE on the playback screen (also INFO and PERFORM) tags, or
+  untags, the track on the deck, as on the CDJ-3000.  It only worked in BROWSE.
 - iOS: sound no longer stops with the ring/silent switch.  The app now
   uses the Playback audio session, as a player must, and picks it up again
   after a call or Siri.
