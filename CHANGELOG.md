@@ -72,6 +72,13 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- Loading from a linked player: a file the player's library names but its
+  NFS export does not resolve by that exact name (a LOOKUP "…" failed, status
+  2) is looked up again in the folder's listing ignoring case, and on every
+  export the player advertises; each miss is logged with what the folder
+  holds.  A load that still fails says so on the screen.
+- BROWSE on a linked player: the INFO pane's calendar row shows the date
+  added when the library has no year for the track.
 - BROWSE on a linked player: FOLDER opens the player's folder tree (folders,
   then the tracks in them) and SEARCH opens the search screen on the
   player's own search; both were listed but did nothing.
