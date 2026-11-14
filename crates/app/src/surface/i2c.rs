@@ -16,13 +16,15 @@
 //! to share between boards (up to eight by address, A0–A2).  Linux only;
 //! elsewhere the surface logs and does nothing.
 
+// Used by the Linux (Pi) build only; dead on other targets.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use super::config::{Deck, Indicator, Surface};
 use super::map::{Key, Mapper};
 use super::Indicators;
 use crate::input::Event;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Gray-code transition table: index (prev << 2 | cur) → step.
 const QUAD: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
