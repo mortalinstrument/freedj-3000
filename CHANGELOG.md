@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- iOS: the log is written to `opendeck-log.txt` in the OpenDeck folder (Files
+  app → OpenDeck DJ), the previous launch's beside it, capped at 4 MB.
+  Before, it went to stderr, which nothing reads without Xcode attached.
 - Stems, experimental: a track with no prepared stems can be split on the
   device with the HTDemucs model (MIT). With MENU → STEMS on, the stem keys
   read "SPLITTING n%" after a load, and the stems play once the split

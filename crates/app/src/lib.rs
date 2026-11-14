@@ -4037,11 +4037,40 @@ pub struct Config {
 }
 
 fn init_logging() {
-    env_logger::Builder::from_env(
+    let mut b = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"),
-    )
-    .format_timestamp_micros()   // beat and frame timing are measured from the log
-    .init();
+    );
+    b.format_timestamp_micros();   // beat and frame timing are measured from the log
+    // iOS: stderr goes nowhere without Xcode attached, so the log also goes to
+    // a file in the OpenDeck folder (Files app → OpenDeck DJ → opendeck-log.txt),
+    // this launch's, with the previous launch's kept beside it as
+    // opendeck-log-previous.txt.  Capped, so a long set cannot fill the iPad.
+    #[cfg(target_os = "ios")]
+    {
+        let dir = taglist::documents_dir();
+        let (cur, old) = (dir.join("opendeck-log.txt"), dir.join("opendeck-log-previous.txt"));
+        let _ = std::fs::rename(&cur, &old);
+        if let Ok(f) = std::fs::File::create(&cur) {
+            b.target(env_logger::Target::Pipe(Box::new(CappedLog { file: f, left: 4 << 20 })));
+        }
+    }
+    b.init();
+}
+
+/// A log file that stops growing at a size limit.
+#[cfg(target_os = "ios")]
+struct CappedLog { file: std::fs::File, left: usize }
+#[cfg(target_os = "ios")]
+impl std::io::Write for CappedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.left > 0 {
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            let _ = std::io::Write::write_all(&mut self.file, &buf[..n]);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { std::io::Write::flush(&mut self.file) }
 }
 
 pub fn desktop_main() -> Result<()> {
