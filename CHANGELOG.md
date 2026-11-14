@@ -81,6 +81,9 @@ All notable changes to this project will be documented in this file.
   drill-downs the player's own screen uses.  Track rows typed "title and
   artist" (0x0704) and the other 0x??04 forms were dropped, so playlists and
   track lists came up empty; they are tracks now.
+- BROWSE on a linked player: the INFO pane shows the highlighted track's
+  album, BPM, key and year from the player's library, and SEARCH uses the
+  player's own search (two letters or more).
 - A track loaded from a linked player takes its title, artist, album, key,
   BPM and year from the player's library when the file's own tags lack them,
   instead of showing the file name.
