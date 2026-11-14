@@ -951,7 +951,7 @@ fn listen_status(link: Arc<LinkState>, beat2_player: Arc<AtomicU32>) -> Option<t
             if let Ok(mut m) = link.peer_media.lock() {
                 let key = (info.player, info.slot);
                 if m.get(&key).map_or(true, |(old, _)| *old != info) {
-                    log::info!("ProDJ Link: player {} {}: {:?}, {} tracks, {} playlists", info.player, info.slot_name(), info.name, info.tracks, info.playlists);
+                    log::info!("ProDJ Link: player {} {}: {:?}, {} tracks, {} playlists, colour {}", info.player, info.slot_name(), info.name, info.tracks, info.playlists, info.color);
                 }
                 m.insert(key, (info, Instant::now()));
             }
