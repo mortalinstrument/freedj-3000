@@ -72,6 +72,9 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- BROWSE on a linked player: FOLDER opens the player's folder tree (folders,
+  then the tracks in them) and SEARCH opens the search screen on the
+  player's own search; both were listed but did nothing.
 - SOURCE on a linked player's USB or SD: the pane shows the stick's songs,
   playlists, date, total and free space as the player reports them (only
   local folders showed them; a linked stick read 0 and 0).
