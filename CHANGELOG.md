@@ -69,6 +69,21 @@ All notable changes to this project will be documented in this file.
   at full scale and keep the MP3 encoder delay, as before; tags read as before.
 
 ### Fixed
+- iOS: sound no longer stops with the ring/silent switch.  The app now
+  uses the Playback audio session, as a player must, and picks it up again
+  after a call or Siri.
+- iOS: the screen is held awake only while a track plays or loads, or for
+  five minutes after the last touch, instead of for as long as the app is
+  open (an idle iPad stayed lit, hot, and draining).
+- Browsing a CDJ-3000 over LINK: every category it lists now opens (GENRE,
+  BPM, RATING, YEAR, LABEL, COLOR, TIME, HISTORY, KEY, ORIGINAL ARTIST,
+  REMIXER, as well as TRACK, PLAYLIST, ARTIST, ALBUM, FILENAME), with the
+  drill-downs the player's own screen uses.  Track rows typed "title and
+  artist" (0x0704) and the other 0x??04 forms were dropped, so playlists and
+  track lists came up empty; they are tracks now.
+- A track loaded from a linked player takes its title, artist, album, key,
+  BPM and year from the player's library when the file's own tags lack them,
+  instead of showing the file name.
 - 32-bit FLAC (FLAC 1.4 and later) loads and plays.  Symphonia 0.5 refused
   it and 0.6.1 decodes its stereo wrongly; the FLAC crate is vendored with
   the open upstream fix (Symphonia PR #587), and decodes bit for bit as the

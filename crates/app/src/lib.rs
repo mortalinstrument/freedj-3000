@@ -773,6 +773,8 @@ struct DeckApp {
     /// Last frame that saw pointer/touch input; full rate is held for a
     /// second after, so a tap's feedback and a scroll are never throttled.
     last_input: Instant,
+    /// Whether the iOS auto-lock is currently held off (see `AWAKE_IDLE`).
+    keep_awake: bool,
     /// Last-seen audio glitch counters, to log only on change.
     prev_underruns: u64,
     prev_drops:     u64,
@@ -1087,6 +1089,7 @@ impl DeckApp {
             },
             full_rate:      true,
             last_input:     Instant::now(),
+            keep_awake:     true,
         }
     }
 
@@ -2269,7 +2272,7 @@ impl DeckApp {
                 }
             };
             log::info!("LINK {ip}: read {size} bytes ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
-            prep.complete(Fetched { name, path: rel_path, audio, grid, t0 }, tx)
+            prep.complete(Fetched { name, path: rel_path, audio, grid, t0, meta: None }, tx)
         })
     }
 
@@ -2290,11 +2293,11 @@ impl DeckApp {
         let known = self.browser.db_track_file(ip, slot, id);
         self.start_fetch(title.clone(), move |tx| {
             let t0 = Instant::now();
-            let (path, grid) = match known {
+            let (path, grid, meta) = match known {
                 Some(r) => r?,
                 None => {
                     let mut db = Client::discover(ip, device)?;
-                    (db.file_path(slot, id)?, db.beat_grid(slot, id))
+                    (db.file_path(slot, id)?, db.beat_grid(slot, id), db.track_meta(slot, id).ok())
                 }
             };
             let path = path.ok_or_else(|| anyhow::anyhow!("LINK {ip}: no file path for track {id}"))?;
@@ -2317,7 +2320,7 @@ impl DeckApp {
             let audio = nfs.read_file(&fh, size)?;
             log::info!("LINK {ip}: read {size} bytes ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
             let name = if title.is_empty() { path.rsplit('/').next().unwrap_or(&path).to_string() } else { title };
-            prep.complete(Fetched { name, path, audio, grid: FetchedGrid::Beats(beats), t0 }, tx)
+            prep.complete(Fetched { name, path, audio, grid: FetchedGrid::Beats(beats), t0, meta }, tx)
         })
     }
 
@@ -3273,6 +3276,16 @@ impl DeckApp {
             || self.transport.preview
             || egui_animating
             || frame_start.duration_since(self.last_input) < Duration::from_secs(1);
+        // Hold the screen awake only while the deck is in use: playing, loading,
+        // or touched in the last AWAKE_IDLE.  An idle deck on the desk then lets
+        // iOS dim and lock the iPad (a lit screen at full brightness is most of
+        // the battery drain and heat of an app sitting idle).
+        let awake = self.audio.playing.load(Ordering::Relaxed) || self.loading.is_some()
+            || frame_start.duration_since(self.last_input) < AWAKE_IDLE;
+        if awake != self.keep_awake {
+            self.keep_awake = awake;
+            set_idle_timer_disabled(awake);
+        }
         if phone { self.phone_swipe(&mut touch); }
         self.events.append(&mut touch);
         let mut pending = std::mem::take(&mut self.events);
@@ -3394,6 +3407,8 @@ extern "C" {
     fn freedj_set_idle_timer_disabled(disabled: bool);
     fn freedj_is_phone() -> bool;
 }
+/// How long an idle deck (not playing, untouched) keeps the iPad awake.
+const AWAKE_IDLE: Duration = Duration::from_secs(300);
 fn set_idle_timer_disabled(disabled: bool) {
     #[cfg(target_os = "ios")]
     unsafe { freedj_set_idle_timer_disabled(disabled); }
@@ -3407,7 +3422,10 @@ fn set_idle_timer_disabled(disabled: bool) {
 struct AnlzLoad { grid: BeatGrid, cue: u64, memory_cues: Vec<u64>, hot_cues: [Option<u64>; 8] }
 
 /// A track fetched over the network by a background thread, ready to decode.
-struct Fetched { name: String, path: String, audio: Vec<u8>, grid: FetchedGrid, t0: Instant }
+struct Fetched { name: String, path: String, audio: Vec<u8>, grid: FetchedGrid, t0: Instant,
+    /// The serving library's title, artist, … (a player's database knows them
+    /// when the file's own tags are missing or unread).
+    meta: Option<opendeck_dbserver::TrackMeta> }
 enum FetchedGrid { None, Anlz(Vec<u8>), Beats(Vec<opendeck_dbserver::GridBeat>) }
 
 /// The deck facts a loader thread needs; captured before the thread starts.
@@ -3478,8 +3496,19 @@ const AUTO_CUE_MAX_SECS: f64 = 60.0;
 impl Prep {
     /// Decode fetched bytes and stream them in (loader thread).
     fn complete(self, f: Fetched, tx: &LoadTx) -> Result<()> {
-        let dec = opendeck_decode::SymphoniaDecoder::open_bytes(f.audio, f.path.rsplit('.').next())
+        let mut dec = opendeck_decode::SymphoniaDecoder::open_bytes(f.audio, f.path.rsplit('.').next())
             .context("failed to open in-memory audio")?;
+        // The file's own tags win; the library fills what they lack.
+        if let Some(m) = f.meta {
+            let t = dec.tags_mut();
+            if t.title.is_none()  { t.title  = m.title; }
+            if t.artist.is_none() { t.artist = m.artist; }
+            if t.album.is_none()  { t.album  = m.album; }
+            if t.genre.is_none()  { t.genre  = m.genre; }
+            if t.key.is_none()    { t.key    = m.key; }
+            if t.year.is_none()   { t.year   = m.year; }
+            if t.bpm.is_none()    { t.bpm    = m.bpm; }
+        }
         let ch = self.deck_ch;
         let grid_cue = match f.grid {
             FetchedGrid::None => None,
@@ -3847,6 +3876,7 @@ impl ApplicationHandler for DeckApp {
                 // Release the auto-lock hold in the background, re-assert it on
                 // foreground (iOS resets idleTimerDisabled when backgrounding).
                 set_idle_timer_disabled(!occluded);
+                if !occluded { self.keep_awake = true; self.last_input = Instant::now(); }
                 if occluded {
                     log::info!("occluded (background): pausing render");
                 } else {
