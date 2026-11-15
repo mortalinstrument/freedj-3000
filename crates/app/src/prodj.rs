@@ -722,7 +722,7 @@ fn link_interface(peers: &[Ipv4Addr]) -> (Ipv4Addr, Ipv4Addr, [u8; 6], String) {
                     let b: Vec<u8> = m.trim().split(':').filter_map(|h| u8::from_str_radix(h, 16).ok()).collect();
                     b.try_into().ok()
                 })
-                .unwrap_or([0x02, 0xfd, 0, 0, 0, 1]);
+                .unwrap_or_else(|| fallback_mac(v4.ip));
             best = Some((score, v4.ip, bc, mac, i.name.clone()));
         }
     }
@@ -730,6 +730,17 @@ fn link_interface(peers: &[Ipv4Addr]) -> (Ipv4Addr, Ipv4Addr, [u8; 6], String) {
         Some((_, ip, bc, mac, name)) => (ip, bc, mac, name),
         None => (Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, [0x02, 0xfd, 0, 0, 0, 1], "lo".into()),
     }
+}
+
+/// The MAC we announce when the interface's own can't be read (macOS and
+/// iOS have no `/sys/class/net`, and iOS hides it from apps): a locally
+/// administered address made from our IPv4 address, so two OpenDecks on one
+/// network never announce the same one.  A CDJ-3000 tells devices apart by
+/// it: with one fixed fallback, an iPad and a Mac looked like one device to
+/// it, and only one of them got its status packets.
+fn fallback_mac(ip: Ipv4Addr) -> [u8; 6] {
+    let o = ip.octets();
+    [0x02, 0xfd, o[0], o[1], o[2], o[3]]
 }
 
 // ── Listeners ─────────────────────────────────────────────────────────────────
@@ -1969,6 +1980,19 @@ mod claim_tests {
 #[cfg(test)]
 mod interface_tests {
     use super::*;
+
+    /// Without a readable MAC (macOS, iOS) each OpenDeck still announces its
+    /// own: two on one network (a Mac and an iPad) got the same fixed one
+    /// before, and a CDJ-3000 sent its status to only one of them.
+    #[test]
+    fn the_fallback_mac_differs_per_device() {
+        let ipad = fallback_mac("192.168.0.99".parse().unwrap());
+        let mac = fallback_mac("192.168.0.249".parse().unwrap());
+        assert_ne!(ipad, mac);
+        assert_eq!(ipad, [0x02, 0xfd, 192, 168, 0, 99]);
+        assert_eq!(ipad[0] & 0b11, 0b10, "locally administered, unicast");
+        assert_eq!(ipad, fallback_mac("192.168.0.99".parse().unwrap()), "stable while the address is");
+    }
 
     #[test]
     fn link_local_is_recognised() {
