@@ -584,18 +584,34 @@ pub fn beat_is_twin(last: &mut HashMap<u8, Instant>, player: u8, now: Instant) -
 // ── Sockets ───────────────────────────────────────────────────────────────────
 
 fn bind_shared(port: u16) -> Option<UdpSocket> {
-    // SO_REUSEADDR + SO_REUSEPORT so the port can be shared with other ProDJ
-    // Link tools (prolink_virtual_cdj, dysentery, a second freedj instance).
+    // On a computer: SO_REUSEADDR + SO_REUSEPORT so the port can be shared
+    // with other ProDJ Link tools (prolink_virtual_cdj, dysentery, a second
+    // freedj instance).
+    //
+    // On iOS the port is ours alone.  With a shared port, broadcasts reach
+    // every socket on it but a unicast datagram reaches only one, so another
+    // app holding 50002 (a second OpenDeck install, another DJ app, even
+    // suspended in the background) silently took the players' status and
+    // media answers: beats arrived, status never did.  Bound exclusively, a
+    // taken port fails to bind and says so.
     let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .map_err(|e| log::warn!("ProDJ Link: socket create failed: {e}"))
         .ok()?;
+    #[cfg(not(target_os = "ios"))]
     raw.set_reuse_address(true).ok();
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "ios")))]
     raw.set_reuse_port(true).ok();
     raw.set_broadcast(true).ok();
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     raw.bind(&addr.into())
-        .map_err(|e| log::warn!("ProDJ Link: cannot bind port {port}: {e}"))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse && cfg!(target_os = "ios") {
+                log::error!("ProDJ Link: port {port} is taken by another app on this device \
+                             (another OpenDeck install or DJ app?); close it and restart OpenDeck");
+            } else {
+                log::warn!("ProDJ Link: cannot bind port {port}: {e}");
+            }
+        })
         .ok()?;
     let sock: UdpSocket = raw.into();
     sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
@@ -771,11 +787,22 @@ fn spawn(name: &str, port: u16, sock: UdpSocket, mut f: impl FnMut(&[u8], Socket
     thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let mut sock = sock;
+            // None while rebinding: the dead socket is closed first, so an
+            // exclusive bind (iOS) does not find the port still ours.
+            let mut sock = Some(sock);
             let mut buf = [0u8; 1500];
             let mut failures = 0u32;
             loop {
-                match sock.recv_from(&mut buf) {
+                let Some(s) = sock.as_ref() else {
+                    thread::sleep(Duration::from_millis(250));
+                    if let Some(s) = bind_shared(port) {
+                        sock = Some(s);
+                        failures = 0;
+                        log::info!("ProDJ Link: port {port} rebound");
+                    }
+                    continue;
+                };
+                match s.recv_from(&mut buf) {
                     Ok((n, addr)) => { failures = 0; if heard_from(addr) { f(&buf[..n], addr) } }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
                     // Benign on Linux UDP: a prior unicast to a peer that has
@@ -793,12 +820,7 @@ fn spawn(name: &str, port: u16, sock: UdpSocket, mut f: impl FnMut(&[u8], Socket
                         // report).  Back off, then bind afresh.
                         failures += 1;
                         if failures == 1 { log::warn!("ProDJ Link recv on {port}: {e} — rebinding"); }
-                        thread::sleep(Duration::from_millis(250));
-                        if let Some(s) = bind_shared(port) {
-                            sock = s;
-                            failures = 0;
-                            log::info!("ProDJ Link: port {port} rebound");
-                        }
+                        sock = None;   // closed now; bound afresh at the top
                     }
                 }
             }
