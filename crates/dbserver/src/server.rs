@@ -23,6 +23,7 @@ use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 
 /// A track we serve.  `id` is what clients use in every later request.
 #[derive(Clone, Debug, Default)]
@@ -662,6 +663,69 @@ fn serve_client(lib: SharedLibrary, device: DeviceNumber, stream: TcpStream) -> 
     Ok(())
 }
 
+/// What the accept loops need of a listener (a real one, or a test's).
+pub(crate) trait Accept {
+    type Conn;
+    fn accept(&self) -> std::io::Result<Self::Conn>;
+}
+
+impl Accept for TcpListener {
+    type Conn = TcpStream;
+    fn accept(&self) -> std::io::Result<TcpStream> { TcpListener::accept(self).map(|(c, _)| c) }
+}
+
+/// A listener that outlives its socket.  iOS reclaims the sockets of an app
+/// that sat suspended, and then every accept fails at once: the loops
+/// (`incoming().flatten()`, which skips errors) spun a core each, and the
+/// dbserver was gone until the app restarted.  Now one failure is waited
+/// out (a connection aborted before it was accepted); a second in a row
+/// closes the listener and binds it again on the same port (peers have
+/// asked 12523 for it).
+pub(crate) struct Revive<L> {
+    name:  &'static str,
+    port:  u16,
+    l:     Option<L>,
+    bind:  Box<dyn FnMut(u16) -> std::io::Result<L> + Send>,
+    pause: Duration,
+}
+
+impl Revive<TcpListener> {
+    fn tcp(name: &'static str, l: TcpListener, port: u16) -> Self {
+        Revive { name, port, l: Some(l), pause: Duration::from_millis(250),
+                 bind: Box::new(|p| TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))) }
+    }
+}
+
+impl<L: Accept> Revive<L> {
+    /// The next connection; waits through a dead listener's rebinding.
+    fn accept(&mut self) -> L::Conn {
+        let mut failed = false;
+        loop {
+            let Some(l) = self.l.as_ref() else {
+                thread::sleep(self.pause);
+                match (self.bind)(self.port) {
+                    Ok(l) => { log::info!("{}: port {} bound again", self.name, self.port); self.l = Some(l); failed = false; }
+                    Err(e) => log::debug!("{}: rebinding {}: {e}", self.name, self.port),
+                }
+                continue;
+            };
+            match l.accept() {
+                Ok(c) => return c,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if !failed => { log::debug!("{}: accept on {}: {e}", self.name, self.port); failed = true; thread::sleep(self.pause); }
+                Err(e) => {
+                    log::warn!("{}: accept on {}: {e}; binding the port again", self.name, self.port);
+                    self.l = None;
+                }
+            }
+        }
+    }
+}
+
+fn accept_forever<L: Accept>(mut l: Revive<L>, mut on: impl FnMut(L::Conn)) -> ! {
+    loop { let c = l.accept(); on(c); }
+}
+
 impl Server {
     /// Start the port-query service (TCP 12523) and the database service
     /// (`db_port`, 0 = ephemeral).  Threads run for the life of the process.
@@ -693,21 +757,20 @@ impl Server {
         let query_port = pq.local_addr()?.port();
         log::info!("dbserver: port query on {query_port}, database on {db_port}, {} tracks", lib.read().unwrap().tracks.len());
         thread::Builder::new().name("dbserver-portquery".into()).spawn(move || {
-            for c in pq.incoming().flatten() {
-                let mut c = c;
+            accept_forever(Revive::tcp("dbserver port query", pq, query_port), |mut c| {
                 let mut q = [0u8; 64];
                 let _ = std::io::Read::read(&mut c, &mut q);
                 log::info!("dbserver: port query from {:?}", c.peer_addr().ok());
                 let _ = c.write_all(&db_port.to_be_bytes());
-            }
+            });
         })?;
         let now = device();
         thread::Builder::new().name("dbserver-accept".into()).spawn(move || {
-            for c in db.incoming().flatten() {
+            accept_forever(Revive::tcp("dbserver", db, db_port), |c| {
                 let (lib, device) = (Arc::clone(&lib), Arc::clone(&device));
                 let _ = c.set_nodelay(true);
                 thread::spawn(move || { if let Err(e) = serve_client(lib, device, c) { log::warn!("dbserver client: {e:#}"); } });
-            }
+            });
         })?;
         Ok(Server { db_port, device: now, query_port })
     }
@@ -720,6 +783,37 @@ impl Server {
 mod tests {
     use super::*;
     use crate::MenuItem;
+
+    /// A listener that answers from a script: each accept takes the next entry.
+    struct Scripted(std::sync::Mutex<std::collections::VecDeque<std::io::Result<u32>>>);
+
+    impl Accept for Scripted {
+        type Conn = u32;
+        fn accept(&self) -> std::io::Result<u32> {
+            self.0.lock().unwrap().pop_front().unwrap_or_else(|| Err(std::io::ErrorKind::InvalidInput.into()))
+        }
+    }
+
+    fn scripted(v: Vec<std::io::Result<u32>>) -> Scripted { Scripted(std::sync::Mutex::new(v.into())) }
+
+    /// A listener iOS reclaimed (every accept fails at once) is bound again
+    /// on the same port instead of spinning a core; a single failed accept
+    /// (a connection aborted before it was taken) is waited out.
+    #[test]
+    fn a_dead_listener_is_bound_again_on_its_port() {
+        use std::io::ErrorKind as K;
+        let binds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b = Arc::clone(&binds);
+        let mut r = Revive {
+            name: "dbserver", port: 1051, pause: Duration::from_millis(1),
+            l: Some(scripted(vec![Err(K::ConnectionAborted.into()), Ok(1), Err(K::InvalidInput.into()), Err(K::InvalidInput.into())])),
+            bind: Box::new(move |port| { b.lock().unwrap().push(port); Ok(scripted(vec![Ok(2)])) }),
+        };
+        assert_eq!(r.accept(), 1, "one failure is waited out");
+        assert!(binds.lock().unwrap().is_empty());
+        assert_eq!(r.accept(), 2, "two in a row: bound again");
+        assert_eq!(*binds.lock().unwrap(), vec![1051]);
+    }
 
     fn lib() -> Library {
         let t = |id, title: &str, artist: &str, album: &str, path: &str| Track {

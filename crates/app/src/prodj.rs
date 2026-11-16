@@ -925,9 +925,54 @@ impl ClaimGuard {
 pub(crate) type Reply = (Vec<u8>, SocketAddr);
 
 /// Send a listener's replies from `sock` (none when it could not be bound).
-fn send_replies(sock: Option<&UdpSocket>, replies: Vec<Reply>) {
-    if let Some(s) = sock {
-        for (pkt, to) in replies { let _ = s.send_to(&pkt, to); }
+fn send_replies(sock: &mut SendSock, replies: Vec<Reply>) {
+    for (pkt, to) in replies { sock.send(&pkt, to); }
+}
+
+/// A socket the listeners answer from (claim defenses, media answers, beat
+/// replies).  iOS reclaims an idle app's sockets; these were made once and
+/// then every send failed, silently: after a trip to the background the deck
+/// stopped answering media queries and defending its player number.  A send
+/// that finds the socket dead opens it again on the same port (the claim
+/// guard knows our defenses by it) and sends once more.
+pub(crate) struct SendSock { sock: Option<UdpSocket>, port: u16, what: &'static str, warned: bool }
+
+impl SendSock {
+    fn open(what: &'static str) -> Self {
+        let mut s = SendSock { sock: None, port: 0, what, warned: false };
+        s.reopen();
+        s
+    }
+
+    fn port(&self) -> Option<u16> { self.sock.as_ref().map(|_| self.port) }
+
+    fn reopen(&mut self) {
+        match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], self.port))) {
+            Ok(s) => {
+                let _ = s.set_broadcast(true);
+                if let Ok(a) = s.local_addr() { self.port = a.port(); }
+                self.sock = Some(s);
+            }
+            Err(e) => log::debug!("ProDJ Link: {} socket: {e}", self.what),
+        }
+    }
+
+    fn send(&mut self, pkt: &[u8], to: SocketAddr) {
+        use std::io::ErrorKind as K;
+        if self.sock.is_none() { self.reopen(); }
+        let Some(s) = &self.sock else { return };
+        match s.send_to(pkt, to) {
+            Ok(_) => self.warned = false,
+            // A refusal or reset surfaced from an earlier send to a player
+            // that has gone is not a dead socket.
+            Err(e) if matches!(e.kind(), K::ConnectionRefused | K::ConnectionReset | K::WouldBlock | K::Interrupted) => {}
+            Err(e) => {
+                if !self.warned { log::warn!("ProDJ Link: {} send to {to}: {e}; opening the socket again", self.what); self.warned = true; }
+                self.sock = None;
+                self.reopen();
+                if let Some(s) = &self.sock { let _ = s.send_to(pkt, to); }
+            }
+        }
     }
 }
 
@@ -979,15 +1024,14 @@ fn listen_announce(link: Arc<LinkState>) -> Option<thread::JoinHandle<()>> {
     let sock = bind_shared(PORT_ANNOUNCE)?;
     log::info!("ProDJ Link: listening for announces on port {PORT_ANNOUNCE}");
     // Defenses go back to the claimant's port 50000 from a socket of our own.
-    let defend_sock = UdpSocket::bind("0.0.0.0:0").ok();
-    if let Some(d) = &defend_sock { let _ = d.set_broadcast(true); }
+    let mut defend_sock = SendSock::open("claim defense");
     let local_ips = if_addrs::get_if_addrs().map(|v| v.into_iter().filter_map(|i| match i.addr { if_addrs::IfAddr::V4(a) => Some(a.ip), _ => None }).collect()).unwrap_or_default();
-    let guard = ClaimGuard { defend_port: defend_sock.as_ref().and_then(|d| d.local_addr().ok()).map(|a| a.port()), local_ips, ..Default::default() };
+    let guard = ClaimGuard { defend_port: defend_sock.port(), local_ips, ..Default::default() };
     let mut rx = AnnounceRx { link, guard };
     spawn("prodj-rx-50000", PORT_ANNOUNCE, sock, move |data, addr| {
         log::trace!("ProDJ rx :50000 {} bytes from {addr} — {:02X?}", data.len(), data);
         diag_packet(50000, addr, data);
-        send_replies(defend_sock.as_ref(), rx.on_packet(data, addr));
+        send_replies(&mut defend_sock, rx.on_packet(data, addr));
     })
 }
 
@@ -1050,12 +1094,12 @@ fn listen_beat(
 ) -> Option<thread::JoinHandle<()>> {
     let sock = bind_shared(PORT_BEAT)?;
     log::info!("ProDJ Link: listening for beats on port {PORT_BEAT}");
-    let tx = UdpSocket::bind("0.0.0.0:0").ok()?;
+    let mut tx = SendSock::open("beat reply");
     let mut rx = BeatRx { link, beat2_bpm, beat2_anchor, beat2_player, beat2_bib, last_beat_at: HashMap::new() };
     spawn("prodj-rx-50001", PORT_BEAT, sock, move |data, addr| {
         log::debug!("ProDJ rx :50001 {} bytes from {addr} — {:02X?}", data.len(), data);
         diag_packet(50001, addr, data);
-        send_replies(Some(&tx), rx.on_packet(data, addr, Instant::now()));
+        send_replies(&mut tx, rx.on_packet(data, addr, Instant::now()));
     })
 }
 
@@ -1161,12 +1205,12 @@ pub fn answer_media_query(link: &LinkState, data: &[u8]) -> Option<(Vec<u8>, Ipv
 fn listen_status(link: Arc<LinkState>, beat2_player: Arc<AtomicU32>) -> Option<thread::JoinHandle<()>> {
     let sock = bind_shared(PORT_STATUS)?;
     log::info!("ProDJ Link: listening for status on port {PORT_STATUS}");
-    let reply_sock = UdpSocket::bind("0.0.0.0:0").ok();
+    let mut reply_sock = SendSock::open("status reply");
     let mut rx = StatusRx { link, beat2_player, last: HashMap::new() };
     spawn("prodj-rx-50002", PORT_STATUS, sock, move |data, addr| {
         log::trace!("ProDJ rx :50002 {} bytes from {addr} — {:02X?}", data.len(), data);
         diag_packet(50002, addr, data);
-        send_replies(reply_sock.as_ref(), rx.on_packet(data, addr));
+        send_replies(&mut reply_sock, rx.on_packet(data, addr));
     })
 }
 
@@ -1735,7 +1779,7 @@ impl ProDjSender {
 
                     // ── Master handoff ───────────────────────────────────────
                     let req = handoff.tick(&link, now, send_full, player);
-                    send_replies(Some(&sock), req.into_iter().collect());
+                    for (pkt, to) in req { let _ = sock.send_to(&pkt, to); }
 
                     // ── SYNC follow ──────────────────────────────────────────
                     let sync = link.sync.load(Ordering::Relaxed) && !link.master.load(Ordering::Relaxed);
@@ -1826,7 +1870,7 @@ impl ProDjSender {
                         if flags_changed {
                             log::info!("ProDJ tx: status master={} sync={} → {} peer(s)", fields.master, fields.sync, out.len());
                         }
-                        send_replies(Some(&sock), out);
+                        for (pkt, to) in out { let _ = sock.send_to(&pkt, to); }
                         last_status = now;
                     }
 
@@ -1985,6 +2029,25 @@ mod claim_tests {
 #[cfg(test)]
 mod interface_tests {
     use super::*;
+
+    /// The listeners' reply sockets come back after iOS reclaims them, on
+    /// the same port (the claim guard knows our defenses by it).
+    #[test]
+    fn a_reply_socket_opens_again_on_its_port() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let to = peer.local_addr().unwrap();
+        let mut s = SendSock::open("test");
+        let port = s.port().expect("open");
+        let mut buf = [0u8; 8];
+        s.send(b"one", to);
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!((&buf[..n], from.port()), (&b"one"[..], port));
+        s.sock = None;   // as after iOS reclaimed it
+        s.send(b"two", to);
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!((&buf[..n], from.port()), (&b"two"[..], port), "reopened on the same port");
+    }
 
     /// Without a readable MAC (macOS, iOS) each OpenDeck still announces its
     /// own: two on one network (a Mac and an iPad) got the same fixed one
