@@ -168,9 +168,10 @@ pub fn export_group(requester: std::net::Ipv4Addr, local: &[(std::net::Ipv4Addr,
     "0.0.0.0/0.0.0.0".into()
 }
 
-fn serve_portmap(sock: UdpSocket, ports: Ports) {
+fn serve_portmap<S: Datagrams>(mut sock: Revive<S>, ports: Ports) {
     let mut buf = [0u8; 2048];
-    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+    loop {
+        let (n, from) = sock.recv_from(&mut buf);
         let d = &buf[..n];
         let Some((xid, prog, _vers, proc_, off)) = parse_call(d) else { log::debug!("portmap: {from} unparsed {n} bytes"); continue };
         log::debug!("portmap: {from} prog {prog} v{_vers} proc {proc_}");
@@ -196,9 +197,10 @@ fn serve_portmap(sock: UdpSocket, ports: Ports) {
     }
 }
 
-fn serve_mountd(sock: UdpSocket, export: Vec<u8>) {
+fn serve_mountd<S: Datagrams>(mut sock: Revive<S>, export: Vec<u8>) {
     let mut buf = [0u8; 4096];
-    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+    loop {
+        let (n, from) = sock.recv_from(&mut buf);
         let d = &buf[..n];
         let Some((xid, prog, _v, proc_, off)) = parse_call(d) else { log::debug!("mountd: {from} unparsed {n} bytes"); continue };
         log::debug!("mountd: {from} prog {prog} v{_v} proc {proc_}");
@@ -229,10 +231,11 @@ fn serve_mountd(sock: UdpSocket, export: Vec<u8>) {
     }
 }
 
-fn serve_nfsd(sock: UdpSocket, tree: Arc<Tree>) {
+fn serve_nfsd<S: Datagrams>(mut sock: Revive<S>, tree: Arc<Tree>) {
     let mut buf = [0u8; 65536];
     let err = |code: u32| { let mut b = Vec::new(); put32(&mut b, code); b };
-    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+    loop {
+        let (n, from) = sock.recv_from(&mut buf);
         let d = &buf[..n];
         let Some((xid, prog, _v, proc_, off)) = parse_call(d) else { log::debug!("nfsd: {from} unparsed {n} bytes"); continue };
         log::debug!("nfsd: {from} prog {prog} v{_v} proc {proc_}");
@@ -309,6 +312,69 @@ fn serve_nfsd(sock: UdpSocket, tree: Arc<Tree>) {
 }
 
 /// A running server: the ports it took.
+/// What the servers need of a UDP socket (a real one, or a test's).
+pub(crate) trait Datagrams {
+    fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)>;
+    fn send_to(&self, buf: &[u8], to: std::net::SocketAddr) -> std::io::Result<usize>;
+}
+
+impl Datagrams for UdpSocket {
+    fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)> { UdpSocket::recv_from(self, buf) }
+    fn send_to(&self, buf: &[u8], to: std::net::SocketAddr) -> std::io::Result<usize> { UdpSocket::send_to(self, buf, to) }
+}
+
+/// A server socket that outlives its socket.  iOS reclaims the sockets of an
+/// app that sat suspended, and then every recv fails at once.  The loops
+/// used to end there (`while let Ok(..)`), silently: after one trip to the
+/// background a player could no longer browse or load our music until the
+/// app restarted.  Now a dead socket is closed and bound again on the same
+/// port (portmap has told the players where mountd and nfsd are), and the
+/// loop goes on.  An ICMP-surfaced refusal or reset (a reply to a player
+/// that has gone) is not a dead socket.
+pub(crate) struct Revive<S> {
+    name:  &'static str,
+    port:  u16,
+    sock:  Option<S>,
+    bind:  Box<dyn FnMut(u16) -> std::io::Result<S> + Send>,
+    pause: std::time::Duration,
+}
+
+impl Revive<UdpSocket> {
+    fn udp(name: &'static str, sock: UdpSocket, port: u16) -> Self {
+        Revive { name, port, sock: Some(sock), pause: std::time::Duration::from_millis(250),
+                 bind: Box::new(|p| UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, p))) }
+    }
+}
+
+impl<S: Datagrams> Revive<S> {
+    /// The next datagram; waits through a dead socket's rebinding.
+    fn recv_from(&mut self, buf: &mut [u8]) -> (usize, std::net::SocketAddr) {
+        use std::io::ErrorKind as K;
+        loop {
+            let Some(s) = self.sock.as_ref() else {
+                std::thread::sleep(self.pause);
+                match (self.bind)(self.port) {
+                    Ok(s) => { log::info!("{}: port {} bound again", self.name, self.port); self.sock = Some(s); }
+                    Err(e) => log::debug!("{}: rebinding {}: {e}", self.name, self.port),
+                }
+                continue;
+            };
+            match s.recv_from(buf) {
+                Ok(r) => return r,
+                Err(e) if matches!(e.kind(), K::ConnectionRefused | K::ConnectionReset | K::WouldBlock | K::TimedOut | K::Interrupted) => {}
+                Err(e) => {
+                    log::warn!("{}: recv on {}: {e}; binding the port again", self.name, self.port);
+                    self.sock = None;
+                }
+            }
+        }
+    }
+
+    fn send_to(&self, buf: &[u8], to: std::net::SocketAddr) -> std::io::Result<usize> {
+        match &self.sock { Some(s) => s.send_to(buf, to), None => Err(std::io::ErrorKind::NotConnected.into()) }
+    }
+}
+
 pub struct NfsServer { pub portmap: u16, pub mountd: u16, pub nfsd: u16 }
 
 impl NfsServer {
@@ -334,6 +400,7 @@ impl NfsServer {
         log::info!("nfs: portmap {} mountd {} nfsd {}; export {export_name:?} = {} nodes", ports.portmap, ports.mountd, ports.nfsd, tree.nodes.len());
         let tree = Arc::new(tree);
         let p = Ports { mountd: ports.mountd, nfsd: ports.nfsd };
+        let (pm, md, nd) = (Revive::udp("portmap", pm, ports.portmap), Revive::udp("mountd", md, ports.mountd), Revive::udp("nfsd", nd, ports.nfsd));
         thread::Builder::new().name("portmap".into()).spawn(move || serve_portmap(pm, p))?;
         let export = wide(export_name);
         thread::Builder::new().name("mountd".into()).spawn(move || serve_mountd(md, export))?;
@@ -345,6 +412,46 @@ impl NfsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A socket that answers from a script: each recv takes the next entry.
+    struct Scripted(std::sync::Mutex<std::collections::VecDeque<std::io::Result<(usize, std::net::SocketAddr)>>>);
+
+    impl Scripted {
+        fn new(v: Vec<std::io::Result<(usize, std::net::SocketAddr)>>) -> Self { Scripted(std::sync::Mutex::new(v.into())) }
+    }
+
+    impl Datagrams for Scripted {
+        fn recv_from(&self, _: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            self.0.lock().unwrap().pop_front().unwrap_or_else(|| Err(std::io::ErrorKind::NotConnected.into()))
+        }
+        fn send_to(&self, b: &[u8], _: std::net::SocketAddr) -> std::io::Result<usize> { Ok(b.len()) }
+    }
+
+    /// A socket iOS reclaimed (every recv fails) is bound again on the same
+    /// port and the server goes on; a refusal or reset from a player that
+    /// has gone is not mistaken for that.
+    #[test]
+    fn a_dead_socket_is_bound_again_on_its_port() {
+        use std::io::ErrorKind as K;
+        let from: std::net::SocketAddr = "192.168.0.194:700".parse().unwrap();
+        let binds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b = std::sync::Arc::clone(&binds);
+        let mut r = Revive {
+            name: "nfsd", port: 2049, pause: std::time::Duration::from_millis(1),
+            // Two transient errors, then the socket dies.
+            sock: Some(Scripted::new(vec![Err(K::ConnectionRefused.into()), Err(K::ConnectionReset.into()), Ok((3, from)), Err(K::NotConnected.into())])),
+            bind: Box::new(move |port| {
+                b.lock().unwrap().push(port);
+                // The first rebind fails (the port not free yet), the next works.
+                if b.lock().unwrap().len() == 1 { Err(K::AddrInUse.into()) } else { Ok(Scripted::new(vec![Ok((5, from))])) }
+            }),
+        };
+        let mut buf = [0u8; 16];
+        assert_eq!(r.recv_from(&mut buf), (3, from), "transient errors are skipped, not rebound");
+        assert!(binds.lock().unwrap().is_empty());
+        assert_eq!(r.recv_from(&mut buf), (5, from), "the dead socket was bound again");
+        assert_eq!(*binds.lock().unwrap(), vec![2049, 2049], "on the same port, retried until free");
+    }
 
     #[test]
     fn serves_a_players_32k_read_whole() {
