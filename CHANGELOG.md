@@ -35,6 +35,22 @@ All notable changes to this project will be documented in this file.
   (`deploy/pi/cross/build.sh`) now includes it.
 
 ### Fixed
+- iPad: a CDJ-3000's status reaches the deck again when another app on
+  the iPad holds the Link ports (a second OpenDeck install, another DJ
+  app, even suspended).  The ports were shared, and a shared port gets
+  broadcasts on every socket but a unicast on only one: the deck saw the
+  player's beats but never its status (no loaded track, loop, WAVEFORM
+  view or INFO tab of it).  On iOS the ports are now ours alone, and a
+  taken port is logged as such.
+- iPad: after a trip to the background, the dbserver spun a core per
+  listener (and was gone), and the NFS servers stopped without a word, so
+  a player could no longer browse, load or show the waveform of the
+  deck's music until the app restarted.  They now bind again on their
+  ports, as the Link listeners already did; so do the sockets the deck
+  answers media queries and defends its player number from.
+- macOS and iOS: each OpenDeck announces a MAC of its own (made from its
+  IPv4 address).  Every one announced the same fallback address, so a
+  CDJ-3000 could take a Mac and an iPad on one network for one device.
 - A Raspberry Pi said NEEDS MORE MEMORY for every split: the check asked
   for the 4.6 GB the iPad's Core ML model needs, where the Rust model
   peaks at 1.2 GB. It now asks for what the model that will run needs
